@@ -250,13 +250,16 @@ verify() {
     exit 1
   fi
 
-  echo "==> Verifying checksums ($hash_cmd, $(nproc) workers)..."
+  local total_parts
+  total_parts=$(wc -l < "$checksum_file")
+
+  echo "==> Verifying checksums ($hash_cmd, $total_parts parts)..."
   echo ""
 
   # Hash all parts in parallel and store results
   local tmpdir
   tmpdir=$(mktemp -d)
-  trap "rm -rf $tmpdir" RETURN
+  trap 'rm -rf "$tmpdir"' RETURN
 
   local pids=()
   while IFS= read -r line; do
@@ -268,10 +271,24 @@ verify() {
     pids+=($!)
   done < "$checksum_file"
 
+  # Progress monitor
+  while true; do
+    local done_count
+    done_count=$(find "$tmpdir" -type f 2>/dev/null | wc -l)
+    printf "\r    Hashing: %d/%d parts complete" "$done_count" "$total_parts" >&2
+    if [ "$done_count" -ge "$total_parts" ]; then
+      break
+    fi
+    sleep 1
+  done
+  printf "\r    Hashing: %d/%d parts complete\n" "$total_parts" "$total_parts" >&2
+
   # Wait for all hashing to complete
   for pid in "${pids[@]}"; do
     wait "$pid"
   done
+
+  echo "" >&2
 
   # Compare results
   local failed=0
