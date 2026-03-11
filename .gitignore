@@ -1,0 +1,9 @@
+# Model weights - downloaded at build time, not stored in git
+models/*
+!models/.gitkeep
+
+# Archived weights from previous builds
+models_archive/
+
+# save folder for tar files for transfer
+save/*
