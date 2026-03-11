@@ -20,6 +20,67 @@ DATE_TAG=$(date +%Y%m%d)
 IMAGE_TAG="${IMAGE_TAG:-${IMAGE_NAME}:${DATE_TAG}}"
 TOKEN_STATUS=$([ -n "$HF_TOKEN" ] && echo "set" || echo "NOT SET")
 
+# Generate checksums for all parts in a directory, per-file in parallel
+generate_checksums() {
+  local dir="$1"
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  trap "rm -rf $tmpdir" RETURN
+
+  local hash_cmds=()
+  if command -v b2sum &>/dev/null; then
+    hash_cmds+=("b2sum:checksums.b2")
+    echo "    BLAKE2 (b2sum)..." >&2
+  fi
+  hash_cmds+=("sha256sum:checksums.sha256")
+  echo "    SHA-256 (sha256sum)..." >&2
+
+  # Count total parts
+  local total_parts
+  total_parts=$(ls "$dir"/model.tar.part* 2>/dev/null | wc -l)
+  local total_jobs=$(( total_parts * ${#hash_cmds[@]} ))
+
+  local pids=()
+  for entry in "${hash_cmds[@]}"; do
+    local cmd="${entry%%:*}"
+    local outfile="${entry##*:}"
+    (
+      cd "$dir"
+      local file_pids=()
+      for part in model.tar.part*; do
+        (
+          hash=$("$cmd" "$part" | awk '{print $1}')
+          echo "$hash  $part" > "$tmpdir/${cmd}_${part}"
+        ) &
+        file_pids+=($!)
+      done
+      for pid in "${file_pids[@]}"; do
+        wait "$pid"
+      done
+      # Assemble results in sorted order
+      cat "$tmpdir"/${cmd}_model.tar.part* | sort -k2 > "$outfile"
+    ) &
+    pids+=($!)
+  done
+
+  # Progress monitor
+  while true; do
+    local done_count
+    done_count=$(find "$tmpdir" -type f 2>/dev/null | wc -l)
+    printf "\r    Progress: %d/%d hashes complete" "$done_count" "$total_jobs" >&2
+    if [ "$done_count" -ge "$total_jobs" ]; then
+      break
+    fi
+    sleep 1
+  done
+
+  for pid in "${pids[@]}"; do
+    wait "$pid"
+  done
+  printf "\r    Progress: %d/%d hashes complete\n" "$total_jobs" "$total_jobs" >&2
+  echo "    Done." >&2
+}
+
 # -- Commands ---------------------------------------------------
 
 show_help() {
@@ -164,23 +225,7 @@ cmd_save() {
   fi
 
   echo "==> Generating checksums..."
-  local pids=()
-
-  if command -v b2sum &>/dev/null; then
-    (cd "$output_dir" && b2sum model.tar.part* > checksums.b2) &
-    pids+=($!)
-    echo "    BLAKE2 (b2sum)..."
-  fi
-
-  (cd "$output_dir" && sha256sum model.tar.part* > checksums.sha256) &
-  pids+=($!)
-  echo "    SHA-256 (sha256sum)..."
-
-  # Wait for all hashing to complete
-  for pid in "${pids[@]}"; do
-    wait "$pid"
-  done
-  echo "    Done."
+  generate_checksums "$output_dir"
 
   # Write a reassembly script
   cat > "${output_dir}/load.sh" <<'LOAD'
@@ -325,22 +370,7 @@ cmd_rehash() {
   rehash_dir() {
     local dir="$1"
     echo "==> Regenerating checksums in $dir/"
-    local pids=()
-
-    if command -v b2sum &>/dev/null; then
-      (cd "$dir" && b2sum model.tar.part* > checksums.b2) &
-      pids+=($!)
-      echo "    BLAKE2 (b2sum)..."
-    fi
-
-    (cd "$dir" && sha256sum model.tar.part* > checksums.sha256) &
-    pids+=($!)
-    echo "    SHA-256 (sha256sum)..."
-
-    for pid in "${pids[@]}"; do
-      wait "$pid"
-    done
-    echo "    Done."
+    generate_checksums "$dir"
   }
 
   if [ -n "$target" ]; then
