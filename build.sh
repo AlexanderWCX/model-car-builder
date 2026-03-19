@@ -3,7 +3,7 @@ set -euo pipefail
 trap 'echo ""; echo "==> Interrupted."; exit 130' INT
 
 # -- Configuration ----------------------------------------------
-MODEL_REPO="Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"
+MODEL_REPO="Qwen/Qwen3-Reranker-4B"
 HF_TOKEN=""
 SPLIT_SIZE="4G"
 # ---------------------------------------------------------------
@@ -19,6 +19,19 @@ MODEL_SLUG=$(echo "$IMAGE_NAME" | sed 's|/|--|g')
 DATE_TAG=$(date +%Y%m%d)
 IMAGE_TAG="${IMAGE_TAG:-${IMAGE_NAME}:${DATE_TAG}}"
 TOKEN_STATUS=$([ -n "$HF_TOKEN" ] && echo "set" || echo "NOT SET")
+
+# Detect container runtime
+detect_runtime() {
+  if command -v podman &>/dev/null; then
+    echo "podman"
+  elif command -v docker &>/dev/null; then
+    echo "docker"
+  else
+    echo "==> Error: Neither podman nor docker found." >&2
+    exit 1
+  fi
+}
+RUNTIME=$(detect_runtime)
 
 # Generate checksums for all parts in a directory, per-file in parallel
 generate_checksums() {
@@ -93,8 +106,9 @@ Commands:
   all       Run the full pipeline (download -> build -> archive)
   download  Download model weights into models/
   build     Build the ModelCar OCI image from models/
+            Optional flag: ./build.sh build --single-layer
   archive   Move models/ into models_archive/<model-slug>/
-  restore   Copy weights from models_archive/ back into models/
+  restore   Move weights from models_archive/ back into models/
             Optionally pass a path: ./build.sh restore models_archive/<dir>
   save      Save the image as split tar files for air-gapped transfer
             Optionally pass an image tag: ./build.sh save <image:tag>
@@ -110,6 +124,7 @@ Configuration:
   HF_TOKEN    $TOKEN_STATUS
   IMAGE_TAG   $IMAGE_TAG
   SPLIT_SIZE  $SPLIT_SIZE
+  RUNTIME     $RUNTIME
 
 Override the image tag:
   IMAGE_TAG=my-model:v1 ./build.sh all
@@ -117,17 +132,26 @@ EOF
 }
 
 cmd_download() {
-  if podman image exists modelcar-downloader:latest 2>/dev/null; then
+  if [ -n "$(find models -mindepth 1 -not -name '.gitkeep' 2>/dev/null)" ]; then
+    echo "==> Error: models/ is not empty."
+    echo "    Run './build.sh clean' or './build.sh archive' first."
+    exit 1
+  fi
+
+  if $RUNTIME image exists modelcar-downloader:latest 2>/dev/null || $RUNTIME image inspect modelcar-downloader:latest &>/dev/null; then
     echo "==> Downloader image already exists, skipping build."
   else
     echo "==> Building downloader image..."
-    podman build -f Containerfile.download -t modelcar-downloader:latest .
+    $RUNTIME build -f Containerfile.download -t modelcar-downloader:latest .
   fi
+
+  local vol_suffix=""
+  [ "$RUNTIME" = "podman" ] && vol_suffix=":Z"
 
   echo ""
   echo "==> Downloading model weights (token: $TOKEN_STATUS)..."
-  podman run --rm -it \
-    -v "$(pwd)/models:/models:Z" \
+  $RUNTIME run --rm -it \
+    -v "$(pwd)/models:/models${vol_suffix}" \
     -e "MODEL_REPO=$MODEL_REPO" \
     -e "HF_TOKEN=$HF_TOKEN" \
     -e "HF_HUB_ENABLE_HF_TRANSFER=1" \
@@ -136,21 +160,61 @@ cmd_download() {
 }
 
 cmd_build() {
-  echo "==> Generating Containerfile..."
+  local single_layer=0
+  if [ "${1:-}" = "--single-layer" ]; then
+    single_layer=1
+    IMAGE_TAG="${IMAGE_TAG%-single}-single"
+    echo "==> Generating Containerfile (single layer)..."
+  else
+    echo "==> Generating Containerfile..."
+  fi
 
   {
     echo "FROM registry.access.redhat.com/ubi9/ubi-micro:latest"
     echo ""
-    echo "# Config and metadata files (small, single layer)"
-    echo "COPY --chown=0:0 --chmod=555 models/*.json models/*.txt models/*.py /models/"
-    echo ""
-    echo "# Each safetensor shard as its own layer for parallel/resumable pulls"
 
-    find models -maxdepth 1 -name '*.safetensors' -printf '%f\n' | sort | while read -r shard; do
-      echo "COPY --chown=0:0 --chmod=555 models/$shard /models/$shard"
-    done
+    if [ "$single_layer" -eq 1 ]; then
+      echo "# All model files in a single layer"
+      echo "COPY --chown=0:0 --chmod=555 models/ /models/"
+    else
+      # Config and metadata files (top-level, non-safetensor)
+      local meta_files
+      meta_files=$(find models -maxdepth 1 -type f -not -name '*.safetensors' -not -name '.gitkeep' -not -name '*.metadata' -not -name '*.lock' 2>/dev/null)
+      if [ -n "$meta_files" ]; then
+        echo "# Config and metadata files (small, single layer)"
+        local globs=""
+        for f in $meta_files; do
+          globs="$globs $f"
+        done
+        echo "COPY --chown=0:0 --chmod=555$globs /models/"
+        echo ""
+      fi
 
-    echo ""
+      # Subdirectories (e.g. 1_Pooling/, 2_Dense/)
+      local subdirs
+      subdirs=$(find models -mindepth 1 -maxdepth 1 -type d -not -name '.cache' -not -name 'download' 2>/dev/null)
+      if [ -n "$subdirs" ]; then
+        echo "# Model subdirectories"
+        for dir in $subdirs; do
+          local dirname
+          dirname=$(basename "$dir")
+          echo "COPY --chown=0:0 --chmod=555 models/$dirname/ /models/$dirname/"
+        done
+        echo ""
+      fi
+
+      # Each safetensor shard as its own layer
+      local shards
+      shards=$(find models -maxdepth 1 -name '*.safetensors' -printf '%f\n' | sort)
+      if [ -n "$shards" ]; then
+        echo "# Each safetensor shard as its own layer for parallel/resumable pulls"
+        echo "$shards" | while read -r shard; do
+          echo "COPY --chown=0:0 --chmod=555 models/$shard /models/$shard"
+        done
+        echo ""
+      fi
+    fi
+
     echo "# nobody user"
     echo "USER 65534"
   } > Containerfile
@@ -162,9 +226,47 @@ cmd_build() {
   echo ""
 
   echo "==> Building ModelCar image: $IMAGE_TAG"
-  podman build --format=oci -t "$IMAGE_TAG" .
+  if [ "$RUNTIME" = "podman" ]; then
+    $RUNTIME build --format=oci -t "$IMAGE_TAG" .
+  else
+    $RUNTIME build -t "$IMAGE_TAG" .
+  fi
 
   rm -f Containerfile
+
+  # Build tokenizer-only image
+  local tokenizer_tag="${IMAGE_TAG}-tokenizer"
+  local tokenizer_files=""
+  for f in models/tokenizer.json models/tokenizer_config.json models/config.json; do
+    if [ -f "$f" ]; then
+      tokenizer_files="$tokenizer_files $f"
+    fi
+  done
+
+  if [ -n "$tokenizer_files" ]; then
+    echo ""
+    echo "==> Building tokenizer image: $tokenizer_tag"
+    {
+      echo "FROM registry.access.redhat.com/ubi9/ubi-micro:latest"
+      echo ""
+      echo "# Tokenizer files only"
+      echo "COPY --chown=0:0 --chmod=555$tokenizer_files /models/"
+      echo ""
+      echo "# nobody user"
+      echo "USER 65534"
+    } > Containerfile
+
+    if [ "$RUNTIME" = "podman" ]; then
+      $RUNTIME build --format=oci -t "$tokenizer_tag" .
+    else
+      $RUNTIME build -t "$tokenizer_tag" .
+    fi
+
+    rm -f Containerfile
+  else
+    echo ""
+    echo "==> Warning: No tokenizer files found, skipping tokenizer image."
+  fi
 }
 
 cmd_archive() {
@@ -204,24 +306,40 @@ cmd_save() {
   local save_slug
   save_slug=$(echo "$save_tag" | tr '[:upper:]' '[:lower:]' | sed 's|[/:]|--|g')
   local output_dir="save/${save_slug}"
+
+  if [ -d "$output_dir" ] && ls "$output_dir"/model.tar.part* &>/dev/null; then
+    echo "==> Error: Save directory already exists: $output_dir/"
+    echo "    Delete it manually if you want to re-save."
+    exit 1
+  fi
+
   mkdir -p "$output_dir"
 
   echo "==> Saving image: $save_tag"
   echo "==> Split size:   $SPLIT_SIZE"
+  echo "==> Runtime:      $RUNTIME"
   echo "==> Output:       $output_dir/"
   echo ""
 
+  # Build save command based on runtime
+  local save_cmd
+  if [ "$RUNTIME" = "podman" ]; then
+    save_cmd="$RUNTIME save --format=oci-archive $save_tag"
+  else
+    save_cmd="$RUNTIME save $save_tag"
+  fi
+
   # Get image size for progress bar
   local image_size
-  image_size=$(podman image inspect "$save_tag" --format '{{.Size}}' 2>/dev/null || echo "0")
+  image_size=$($RUNTIME image inspect "$save_tag" --format '{{.Size}}' 2>/dev/null || echo "0")
 
   if command -v pv &>/dev/null && [ "$image_size" -gt 0 ]; then
-    podman save "$save_tag" | pv -s "$image_size" | split -b "$SPLIT_SIZE" -d - "${output_dir}/model.tar.part"
+    $save_cmd | pv -s "$image_size" | split -b "$SPLIT_SIZE" -d - "${output_dir}/model.tar.part"
   else
     if ! command -v pv &>/dev/null; then
-      echo "    (install 'pv' for a progress bar: apt install pv)"
+      echo "    (install 'pv' for a progress bar: apt install pv / dnf install pv)"
     fi
-    podman save "$save_tag" | split -b "$SPLIT_SIZE" -d - "${output_dir}/model.tar.part"
+    $save_cmd | split -b "$SPLIT_SIZE" -d - "${output_dir}/model.tar.part"
   fi
 
   echo "==> Generating checksums..."
@@ -231,6 +349,16 @@ cmd_save() {
   cat > "${output_dir}/load.sh" <<'LOAD'
 #!/bin/bash
 set -euo pipefail
+
+# Auto-detect container runtime
+if command -v podman &>/dev/null; then
+  RUNTIME="podman"
+elif command -v docker &>/dev/null; then
+  RUNTIME="docker"
+else
+  echo "==> Error: Neither podman nor docker found."
+  exit 1
+fi
 
 verify() {
   # Detect checksum file and matching tool
@@ -352,8 +480,8 @@ case "${1:-}" in
   load)
     if verify; then
       echo ""
-      echo "==> Reassembling and loading image..."
-      pipe_with_progress | podman load
+      echo "==> Reassembling and loading image ($RUNTIME)..."
+      pipe_with_progress | $RUNTIME load
       echo "==> Done."
     else
       exit 1
@@ -367,7 +495,7 @@ case "${1:-}" in
     echo "Commands:"
     echo "  verify    Check checksums only"
     echo "  assemble  Check checksums and reassemble into model.tar"
-    echo "  load      Check checksums and load into podman"
+    echo "  load      Check checksums and load into $RUNTIME"
     ;;
 esac
 LOAD
@@ -379,6 +507,50 @@ LOAD
   echo ""
   echo "    Transfer all files in $output_dir/ to the air-gapped host,"
   echo "    then run ./load.sh to verify and load the image."
+
+  # Auto-save tokenizer image if it exists
+  local tokenizer_tag="${save_tag}-tokenizer"
+  if $RUNTIME image inspect "$tokenizer_tag" &>/dev/null; then
+    echo ""
+    echo "==> Tokenizer image found, saving: $tokenizer_tag"
+    local tokenizer_slug="${save_slug}-tokenizer"
+    local tokenizer_dir="save/${tokenizer_slug}"
+    mkdir -p "$tokenizer_dir"
+
+    if [ "$RUNTIME" = "podman" ]; then
+      $RUNTIME save --format=oci-archive "$tokenizer_tag" > "${tokenizer_dir}/model.tar.part00"
+    else
+      $RUNTIME save "$tokenizer_tag" > "${tokenizer_dir}/model.tar.part00"
+    fi
+
+    echo "==> Generating checksums..."
+    generate_checksums "$tokenizer_dir"
+
+    # Write load.sh for tokenizer
+    cat > "${tokenizer_dir}/load.sh" <<'TLOAD'
+#!/bin/bash
+set -euo pipefail
+if command -v podman &>/dev/null; then RUNTIME="podman"
+elif command -v docker &>/dev/null; then RUNTIME="docker"
+else echo "==> Error: Neither podman nor docker found."; exit 1; fi
+
+echo "==> Verifying checksum..."
+if [ -f checksums.b2 ] && command -v b2sum &>/dev/null; then
+  b2sum -c checksums.b2
+elif [ -f checksums.sha256 ]; then
+  sha256sum -c checksums.sha256
+fi
+
+echo "==> Loading tokenizer image ($RUNTIME)..."
+$RUNTIME load -i model.tar.part00
+echo "==> Done."
+TLOAD
+    chmod +x "${tokenizer_dir}/load.sh"
+
+    echo ""
+    echo "==> Saved tokenizer to $tokenizer_dir/:"
+    ls -lh "$tokenizer_dir/"
+  fi
 }
 
 cmd_rehash() {
@@ -428,6 +600,7 @@ cmd_status() {
   echo "    IMAGE_TAG:   $IMAGE_TAG"
   echo "    MODEL_SLUG:  $MODEL_SLUG"
   echo "    SPLIT_SIZE:  $SPLIT_SIZE"
+  echo "    RUNTIME:     $RUNTIME"
   echo ""
 
   echo "==> models/"
@@ -472,6 +645,7 @@ cmd_all() {
   echo "==> Model:   $MODEL_REPO"
   echo "==> Image:   $IMAGE_TAG"
   echo "==> Token:   $TOKEN_STATUS"
+  echo "==> Runtime: $RUNTIME"
   echo ""
 
   cmd_download
@@ -484,12 +658,15 @@ cmd_all() {
 
   echo ""
   echo "==> Done."
-  echo "    Image:   $IMAGE_TAG"
-  echo "    Weights: $ARCHIVE_DIR/$MODEL_SLUG/"
+  echo "    Image:     $IMAGE_TAG"
+  echo "    Tokenizer: ${IMAGE_TAG}-tokenizer"
+  echo "    Weights:   $ARCHIVE_DIR/$MODEL_SLUG/"
   echo ""
   echo "    Next steps:"
-  echo "      podman tag $IMAGE_TAG <your-registry>/$IMAGE_TAG"
-  echo "      podman push <your-registry>/$IMAGE_TAG"
+  echo "      $RUNTIME tag $IMAGE_TAG <your-registry>/$IMAGE_TAG"
+  echo "      $RUNTIME push <your-registry>/$IMAGE_TAG"
+  echo "      $RUNTIME tag ${IMAGE_TAG}-tokenizer <your-registry>/${IMAGE_TAG}-tokenizer"
+  echo "      $RUNTIME push <your-registry>/${IMAGE_TAG}-tokenizer"
   echo ""
   echo "    For air-gapped transfer:"
   echo "      ./build.sh save"
@@ -505,7 +682,7 @@ fi
 case "${1:-}" in
   all)      cmd_all      ;;
   download) cmd_download ;;
-  build)    cmd_build    ;;
+  build)    cmd_build "${2:-}" ;;
   archive)  cmd_archive  ;;
   restore)  cmd_restore "${2:-}" ;;
   save)     cmd_save "${2:-}" ;;

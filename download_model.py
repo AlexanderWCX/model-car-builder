@@ -9,7 +9,7 @@ print(f"Downloading {model_repo} to {output_dir}...")
 snapshot_download(
     repo_id=model_repo,
     local_dir=output_dir,
-    allow_patterns=["*.safetensors", "*.json", "*.txt", "*.py"],
+    ignore_patterns=["*.gguf", "*.bin", "*.onnx", "*.msgpack", "*.h5", "*.ot"],
 )
 
 print("Download complete.")

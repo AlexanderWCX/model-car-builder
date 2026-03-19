@@ -2,8 +2,11 @@
 models/*
 !models/.gitkeep
 
+# Generated at build time
+Containerfile
+
 # Archived weights from previous builds
 models_archive/
 
-# save folder for tar files for transfer
-save/*
+# Saved image splits for air-gapped transfer
+save/

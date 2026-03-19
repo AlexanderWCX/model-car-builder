@@ -2,26 +2,20 @@
 
 Build OCI container images from any HuggingFace model for deployment on Red Hat OpenShift AI (RHOAI) using KServe's ModelCar capabilities.
 
-The entire process runs inside containers — no local Python installation required.
+The entire process runs inside containers -- no local Python installation required. Works with both Podman and Docker (prefers Podman, falls back to Docker).
 
 ## Prerequisites
 
-- Podman with the Docker-compatible API socket enabled (`systemctl --user enable --now podman.socket`), or Docker with `docker compose`
-  - Alternatively, install [`podman-compose`](https://github.com/containers/podman-compose) (`apt install podman-compose` / `pip install podman-compose`) and replace `podman compose` with `podman-compose` in the commands below
+- Podman (or Docker)
 - Sufficient disk space for the model weights (2x the model size to account for build layers)
 - Internet access to `registry.access.redhat.com` and `huggingface.co`
+- (Optional) `pv` for progress bars: `apt install pv` / `dnf install pv`
 
 ## Quick start
 
-Edit the configuration at the top of `build.sh`:
+Edit `build.sh` and set `MODEL_REPO` to the HuggingFace model you want to package. If the model is gated, set `HF_TOKEN` to your HuggingFace token.
 
-```bash
-MODEL_REPO="Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"
-HF_TOKEN=""        # Set for gated models
-SPLIT_SIZE="4G"    # Split size for air-gapped exports
-```
-
-Then run the full pipeline:
+Then run:
 
 ```bash
 ./build.sh all
@@ -29,9 +23,17 @@ Then run the full pipeline:
 
 This will:
 
-1. Download the model weights into `models/`.
-2. Build the ModelCar OCI image.
-3. Move the weights into `models_archive/<model-slug>/` so `models/` is clean for the next build.
+1. Build a temporary downloader image.
+2. Download the model weights into `models/`.
+3. Build the ModelCar OCI image with per-shard layers.
+4. Move the weights into `models_archive/<model-slug>/` so `models/` is clean for the next build.
+
+Then push to your registry:
+
+```bash
+podman tag <image-tag> <your-registry>/<image-name>:<tag>
+podman push <your-registry>/<image-name>:<tag>
+```
 
 Override the image tag if needed:
 
@@ -39,150 +41,112 @@ Override the image tag if needed:
 IMAGE_TAG=my-model:v1 ./build.sh all
 ```
 
-Then push to your registry:
-
-```bash
-podman tag <image-tag> quay.io/<your-registry>/<image-name>:<tag>
-podman push quay.io/<your-registry>/<image-name>:<tag>
-```
-
 ## Commands
 
-```
-./build.sh <command>
+Run `./build.sh` with no arguments to see all available commands:
 
-all       Run the full pipeline (download -> build -> archive)
-download  Download model weights into models/
-build     Build the ModelCar OCI image from models/
-archive   Move models/ into models_archive/<model-slug>/
-save      Save the image as split tar files for air-gapped transfer
-          Optionally pass an image tag: ./build.sh save <image:tag>
-rehash    Regenerate checksums for save directories
-          Optionally pass a path: ./build.sh rehash save/<dir>
-          With no argument, rehashes all directories under save/
-clean     Delete all downloaded weights from models/
-status    Show current configuration and state
+```
+Usage: ./build.sh <command>
+
+Commands:
+  all       Run the full pipeline (download -> build -> archive)
+  download  Download model weights into models/
+  build     Build the ModelCar OCI image from models/
+              Optional flag: ./build.sh build --single-layer
+  archive   Move models/ into models_archive/<model-slug>/
+  restore   Move weights from models_archive/ back into models/
+              Optionally pass a path: ./build.sh restore models_archive/<dir>
+  save      Save the image as split tar files for air-gapped transfer
+              Optionally pass an image tag: ./build.sh save <image:tag>
+  rehash    Regenerate checksums for a save directory
+              Optionally pass a path: ./build.sh rehash save/<dir>
+  clean     Delete all downloaded weights from models/
+  status    Show current configuration and state
+```
+
+### Individual steps
+
+Each step can be run independently:
+
+```bash
+./build.sh download                 # download weights
+./build.sh build                    # build OCI image (per-shard layers)
+./build.sh build --single-layer     # build OCI image (single layer)
+./build.sh archive                  # move weights to archive
+./build.sh restore                  # move weights back from archive
+./build.sh clean                    # delete contents of models/
+./build.sh status                   # show current state
 ```
 
 ## Air-gapped transfer
 
-### Using build.sh (recommended)
+### Using `./build.sh save` (recommended)
 
-Export the image as split tarballs with checksums:
+The `save` command saves the image as split tar files with checksums, sized for transfer over slow or limited connections:
 
 ```bash
 ./build.sh save
 ```
 
-This creates a directory under `save/` containing split tar files, checksums (SHA-256 and BLAKE2 if `b2sum` is available), and a `load.sh` helper script.
+This creates a `save/<model-slug>/` directory containing split parts, checksums, and a `load.sh` script. Transfer all files to the air-gapped host.
 
-Transfer the entire directory to the air-gapped host, then:
-
-```bash
-# Verify checksums only
-./load.sh verify
-
-# Verify and load into podman
-./load.sh load
-
-# Verify and reassemble into a single tar file
-./load.sh assemble
-```
-
-To regenerate checksums after a transfer or modification:
+On the air-gapped side:
 
 ```bash
-./build.sh rehash save/<dir>
-
-# Or rehash all save directories at once
-./build.sh rehash
+./load.sh           # show help
+./load.sh verify    # check checksums only
+./load.sh assemble  # check checksums and reassemble into model.tar
+./load.sh load      # check checksums and load into podman/docker
 ```
 
-### Using podman directly
+Configure the split size (default `4G`) by editing `SPLIT_SIZE` at the top of `build.sh`.
+
+To save an arbitrary image (not just the configured model):
+
+```bash
+./build.sh save nginx:latest
+./build.sh save registry.redhat.io/rhaiis/vllm-cuda-rhel9:3.2.5
+```
+
+### Checksums
+
+Both BLAKE2 (`b2sum`) and SHA-256 (`sha256sum`) checksums are generated in parallel during save. The load script auto-detects which is available, preferring BLAKE2 for speed.
+
+To regenerate checksums for existing save directories:
+
+```bash
+./build.sh rehash                          # rehash all save directories
+./build.sh rehash save/qwen--qwen3-vl...   # rehash a specific one
+```
+
+### Cross-platform compatibility
+
+The `save` and `load` scripts auto-detect Podman or Docker. Images saved with Docker can be loaded with Podman and vice versa.
+
+Note: When Podman is detected, `save` uses `--format=oci-archive` (supports zstd-compressed layers). When Docker is detected, it uses the default Docker archive format. Both formats are loadable by both runtimes.
+
+### Using podman/docker directly
 
 ```bash
 # Internet-connected side
-podman save -o model.tar quay.io/<your-registry>/<image-name>:<tag>
+podman save --format=oci-archive -o model.tar <image-name>:<tag>
 
 # Sneakernet the tar file across
 
 # Air-gapped side
 podman load -i model.tar
-podman tag quay.io/<your-registry>/<image-name>:<tag> \
-  <internal-registry>/<image-name>:<tag>
+podman tag <image-name>:<tag> <internal-registry>/<image-name>:<tag>
 podman push <internal-registry>/<image-name>:<tag>
 ```
 
 ### Using skopeo
 
-Preserves manifest digests, no local container storage needed:
-
 ```bash
 # Internet-connected side
-skopeo copy \
-  containers-storage:quay.io/<your-registry>/<image-name>:<tag> \
-  oci-archive:model.tar
+skopeo copy containers-storage:<image-name>:<tag> oci-archive:model.tar
 
 # Air-gapped side
-skopeo copy \
-  oci-archive:model.tar \
-  docker://<internal-registry>/<image-name>:<tag>
-```
-
-## Manual workflow
-
-If you prefer to run each step individually instead of using `build.sh`:
-
-### 1. Download weights
-
-Edit `compose.yaml` and set `MODEL_REPO` to the HuggingFace model you want to package. If the model is gated, set `HF_TOKEN` to your HuggingFace token.
-
-```bash
-podman compose up
-```
-
-```bash
-ls -lh models/
-```
-
-You should see `.safetensors` weight shards, `config.json`, `tokenizer.json`, and related files.
-
-### 2. Build the ModelCar image
-
-```bash
-podman build --format=oci \
-  -t quay.io/<your-registry>/<image-name>:<tag> .
-```
-
-### 3. Archive the model weights
-
-```bash
-mkdir -p models_archive/<model-slug>
-mv models/* models_archive/<model-slug>/
-touch models/.gitkeep
-```
-
-To restore archived weights for a rebuild later:
-
-```bash
-cp -r models_archive/<model-slug>/* models/
-```
-
-### 4. Push to your registry
-
-```bash
-podman login quay.io
-podman push quay.io/<your-registry>/<image-name>:<tag>
-```
-
-## Using Docker instead of Podman
-
-Replace `podman compose` with `docker compose` and `podman build` with `docker build`. Drop the `--format=oci` flag as Docker builds OCI format by default:
-
-```bash
-docker compose up
-docker build -t <your-registry>/<image-name>:<tag> .
-docker push <your-registry>/<image-name>:<tag>
+skopeo copy oci-archive:model.tar docker://<internal-registry>/<image-name>:<tag>
 ```
 
 ## Deploying on RHOAI
@@ -237,28 +201,27 @@ spec:
         operator: Exists
 ```
 
-> **Note:** The `progress-deadline` of 30 minutes is important — the first pull
+> **Note:** The `progress-deadline` of 30 minutes is important -- the first pull
 > of large model images can exceed the default 10-minute KNative timeout.
 
 ## File structure
 
 ```
 .
-├── build.sh                   # Automated workflow (download, build, archive, save, rehash, etc.)
-├── compose.yaml               # Builds and runs the downloader in one command
-├── Containerfile.download     # Downloader image (Python + huggingface-hub)
+├── build.sh                   # Main script: download, build, archive, save, rehash, etc.
+├── Containerfile              # Generated at build time (one layer per safetensor shard)
+├── Containerfile.download     # Downloader image (Python + huggingface-hub + hf_transfer)
 ├── download_model.py          # Download script (configurable via env vars)
 ├── models/                    # Downloaded weights (gitignored except .gitkeep)
 │   └── .gitkeep
 ├── models_archive/            # Archived weights per model (gitignored)
-├── save/                      # Exported split tarballs for air-gapped transfer
+├── save/                      # Split image tarballs for air-gapped transfer (gitignored)
 │   └── <model-slug>/
-│       ├── model.tar.part00
-│       ├── model.tar.part01
-│       ├── ...
-│       ├── checksums.sha256
-│       ├── checksums.b2       # If b2sum was available at save time
-│       └── load.sh            # Verify, assemble, and load helper
+│       ├── checksums.b2       # BLAKE2 checksums (if b2sum available)
+│       ├── checksums.sha256   # SHA-256 checksums
+│       ├── load.sh            # Self-contained verify/assemble/load script
+│       └── model.tar.part*    # Split image parts
+├── .containerignore           # Excludes archive/save/cache dirs from build context
 ├── .gitignore
 └── README.md
 ```
