@@ -2,11 +2,16 @@
 models/*
 !models/.gitkeep
 
+# Dataset files - downloaded at build time, not stored in git
+datasets/*
+!datasets/.gitkeep
+
 # Generated at build time
 Containerfile
 
 # Archived weights from previous builds
 models_archive/
+datasets_archive/
 
 # Saved image splits for air-gapped transfer
 save/

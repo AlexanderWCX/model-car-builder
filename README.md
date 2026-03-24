@@ -1,6 +1,6 @@
 # ModelCar Builder
 
-Build OCI container images from any HuggingFace model for deployment on Red Hat OpenShift AI (RHOAI) using KServe's ModelCar capabilities.
+Build OCI container images from any HuggingFace model or dataset for deployment on Red Hat OpenShift AI (RHOAI) using KServe's ModelCar capabilities.
 
 The entire process runs inside containers -- no local Python installation required. Works with both Podman and Docker (prefers Podman, falls back to Docker).
 
@@ -13,7 +13,7 @@ The entire process runs inside containers -- no local Python installation requir
 
 ## Quick start
 
-Edit `build.sh` and set `MODEL_REPO` to the HuggingFace model you want to package. If the model is gated, set `HF_TOKEN` to your HuggingFace token.
+Edit `build.sh` and set `MODEL_REPO` (or `DATASET_REPO` for datasets) at the top. Only set one at a time. If the repo is gated, set `HF_TOKEN`.
 
 Then run:
 
@@ -24,9 +24,10 @@ Then run:
 This will:
 
 1. Build a temporary downloader image.
-2. Download the model weights into `models/`.
-3. Build the ModelCar OCI image with per-shard layers.
-4. Move the weights into `models_archive/<model-slug>/` so `models/` is clean for the next build.
+2. Download the model weights (or dataset) into the staging directory.
+3. Build the OCI image with per-shard layers.
+4. Build a tokenizer-only image (models only).
+5. Move the files into the archive directory so staging is clean for the next build.
 
 Then push to your registry:
 
@@ -50,33 +51,71 @@ Usage: ./build.sh <command>
 
 Commands:
   all       Run the full pipeline (download -> build -> archive)
-  download  Download model weights into models/
-  build     Build the ModelCar OCI image from models/
+  download  Download model weights or dataset into staging directory
+  build     Build the OCI image from staged files
               Optional flag: ./build.sh build --single-layer
-  archive   Move models/ into models_archive/<model-slug>/
-  restore   Move weights from models_archive/ back into models/
-              Optionally pass a path: ./build.sh restore models_archive/<dir>
-  save      Save the image as split tar files for air-gapped transfer
+  archive   Move staged files into archive directory
+  restore   Move files from archive back into staging directory
+              Optionally pass a path: ./build.sh restore <archive-dir>
+  clean     Delete all files from staging directory
+  save      Save an image as split tar files for air-gapped transfer
               Optionally pass an image tag: ./build.sh save <image:tag>
   rehash    Regenerate checksums for a save directory
               Optionally pass a path: ./build.sh rehash save/<dir>
-  clean     Delete all downloaded weights from models/
   status    Show current configuration and state
 ```
+
+All commands automatically detect whether you're working with a model or dataset based on which config variable is set (`MODEL_REPO` or `DATASET_REPO`). Only one can be set at a time.
 
 ### Individual steps
 
 Each step can be run independently:
 
 ```bash
-./build.sh download                 # download weights
+./build.sh download                 # download model/dataset
 ./build.sh build                    # build OCI image (per-shard layers)
 ./build.sh build --single-layer     # build OCI image (single layer)
-./build.sh archive                  # move weights to archive
-./build.sh restore                  # move weights back from archive
-./build.sh clean                    # delete contents of models/
+./build.sh archive                  # move staged files to archive
+./build.sh restore                  # move files back from archive
+./build.sh clean                    # delete contents of staging directory
 ./build.sh status                   # show current state
 ```
+
+### Build modes
+
+The default build creates one OCI layer per safetensor shard. This enables parallel registry pulls and per-layer resumability, and reduces temp disk space needed during build.
+
+The `--single-layer` flag copies all model files in a single `COPY` instruction. The image tag is suffixed with `-single` to distinguish it:
+
+```
+./build.sh build                  -> qwen/qwen3-reranker-4b:20260319
+./build.sh build --single-layer   -> qwen/qwen3-reranker-4b:20260319-single
+```
+
+### Tokenizer image
+
+Every build automatically creates a tokenizer-only image tagged `<image-tag>-tokenizer` containing just `tokenizer.json`, `tokenizer_config.json`, and `config.json`. This is useful for attaching to a vLLM instance for benchmarking without loading the full model weights.
+
+If no tokenizer files are found, the tokenizer image is skipped with a warning.
+
+## Datasets
+
+To package a HuggingFace dataset as an OCI image, set `DATASET_REPO` (and clear `MODEL_REPO`) at the top of `build.sh`:
+
+```bash
+# In build.sh:
+MODEL_REPO=""
+DATASET_REPO="lmarena-ai/VisionArena-Chat"
+```
+
+Then use the same commands:
+
+```bash
+./build.sh all                     # download -> build -> archive
+./build.sh save <dataset-tag>      # split + checksum for air-gapped transfer
+```
+
+Parquet files get individual layers (same pattern as safetensor shards). The dataset image tag is derived from `DATASET_REPO` with a date stamp.
 
 ## Air-gapped transfer
 
@@ -107,6 +146,8 @@ To save an arbitrary image (not just the configured model):
 ./build.sh save nginx:latest
 ./build.sh save registry.redhat.io/rhaiis/vllm-cuda-rhel9:3.2.5
 ```
+
+The tokenizer image is automatically saved alongside the model image when present.
 
 ### Checksums
 
@@ -208,22 +249,24 @@ spec:
 
 ```
 .
-├── build.sh                   # Main script: download, build, archive, save, rehash, etc.
-├── Containerfile              # Generated at build time (one layer per safetensor shard)
-├── Containerfile.download     # Downloader image (Python + huggingface-hub + hf_transfer)
-├── download_model.py          # Download script (configurable via env vars)
-├── models/                    # Downloaded weights (gitignored except .gitkeep)
-│   └── .gitkeep
-├── models_archive/            # Archived weights per model (gitignored)
-├── save/                      # Split image tarballs for air-gapped transfer (gitignored)
-│   └── <model-slug>/
-│       ├── checksums.b2       # BLAKE2 checksums (if b2sum available)
-│       ├── checksums.sha256   # SHA-256 checksums
-│       ├── load.sh            # Self-contained verify/assemble/load script
-│       └── model.tar.part*    # Split image parts
-├── .containerignore           # Excludes archive/save/cache dirs from build context
-├── .gitignore
-└── README.md
+|-- build.sh                   # Main script: download, build, archive, save, rehash, etc.
+|-- Containerfile              # Generated at build time (one layer per shard)
+|-- Containerfile.download     # Downloader image (Python + huggingface-hub + hf_transfer)
+|-- download_model.py          # Download script (supports models and datasets)
+|-- models/                    # Model weight staging area (gitignored except .gitkeep)
+|   +-- .gitkeep
+|-- datasets/                  # Dataset staging area (gitignored except .gitkeep)
+|   +-- .gitkeep
+|-- models_archive/            # Archived model weights (gitignored)
+|-- save/                      # Split image tarballs for air-gapped transfer (gitignored)
+|   +-- <model-slug>/
+|       |-- checksums.b2       # BLAKE2 checksums (if b2sum available)
+|       |-- checksums.sha256   # SHA-256 checksums
+|       |-- load.sh            # Self-contained verify/assemble/load script
+|       +-- model.tar.part*    # Split image parts
+|-- .containerignore           # Excludes archive/save/cache dirs from build context
+|-- .gitignore
++-- README.md
 ```
 
 ## References

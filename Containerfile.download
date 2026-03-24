@@ -1,9 +1,10 @@
 FROM registry.access.redhat.com/ubi9/python-311:latest
 
 USER root
-RUN pip install --no-cache-dir huggingface-hub hf_transfer
+RUN pip install --no-cache-dir huggingface-hub hf_transfer pandas pyarrow
 
 COPY download_model.py /app/download_model.py
+COPY convert_parquet.py /app/convert_parquet.py
 WORKDIR /app
 
 ENTRYPOINT ["python", "download_model.py"]

@@ -3,24 +3,52 @@ set -euo pipefail
 trap 'echo ""; echo "==> Interrupted."; exit 130' INT
 
 # -- Configuration ----------------------------------------------
-MODEL_REPO="Qwen/Qwen3-Reranker-4B"
+# Set ONE of these. Do not set both.
+MODEL_REPO=""
+DATASET_REPO=""
 HF_TOKEN=""
 SPLIT_SIZE="4G"
 # ---------------------------------------------------------------
 
-ARCHIVE_DIR="models_archive"
+# -- Mode detection ---------------------------------------------S
+if [ -n "$MODEL_REPO" ] && [ -n "$DATASET_REPO" ]; then
+  echo "Error: Both MODEL_REPO and DATASET_REPO are set. Set only one at a time."
+  exit 1
+fi
 
-# Derive image name: lowercase the repo (OCI spec requires lowercase)
-IMAGE_NAME=$(echo "$MODEL_REPO" | tr '[:upper:]' '[:lower:]')
+if [ -n "$MODEL_REPO" ]; then
+  MODE="model"
+  REPO_ID="$MODEL_REPO"
+  WORK_DIR="models"
+  ARCHIVE_DIR="models_archive"
+elif [ -n "$DATASET_REPO" ]; then
+  MODE="dataset"
+  REPO_ID="$DATASET_REPO"
+  WORK_DIR="datasets"
+  ARCHIVE_DIR="datasets_archive"
+else
+  MODE="none"
+  REPO_ID=""
+  WORK_DIR=""
+  ARCHIVE_DIR=""
+fi
 
-# Derive a filesystem-safe name for archiving: Qwen/Qwen3-VL-30B -> qwen--qwen3-vl-30b
-MODEL_SLUG=$(echo "$IMAGE_NAME" | sed 's|/|--|g')
+# Derived variables (only when a repo is set)
+if [ -n "$REPO_ID" ]; then
+  IMAGE_NAME=$(echo "$REPO_ID" | tr '[:upper:]' '[:lower:]')
+  SLUG=$(echo "$IMAGE_NAME" | sed 's|/|--|g')
+  DATE_TAG=$(date +%Y%m%d)
+  IMAGE_TAG="${IMAGE_TAG:-${IMAGE_NAME}:${DATE_TAG}}"
+else
+  IMAGE_NAME=""
+  SLUG=""
+  DATE_TAG=$(date +%Y%m%d)
+  IMAGE_TAG=""
+fi
 
-DATE_TAG=$(date +%Y%m%d)
-IMAGE_TAG="${IMAGE_TAG:-${IMAGE_NAME}:${DATE_TAG}}"
 TOKEN_STATUS=$([ -n "$HF_TOKEN" ] && echo "set" || echo "NOT SET")
 
-# Detect container runtime
+# Detect container runtime (prefer podman)
 detect_runtime() {
   if command -v podman &>/dev/null; then
     echo "podman"
@@ -32,6 +60,16 @@ detect_runtime() {
   fi
 }
 RUNTIME=$(detect_runtime)
+
+# -- Helpers ----------------------------------------------------
+
+require_repo() {
+  if [ "$MODE" = "none" ]; then
+    echo "==> Error: Neither MODEL_REPO nor DATASET_REPO is set."
+    echo "    Edit the top of build.sh and set one of them."
+    exit 1
+  fi
+}
 
 # Generate checksums for all parts in a directory, per-file in parallel
 generate_checksums() {
@@ -48,7 +86,6 @@ generate_checksums() {
   hash_cmds+=("sha256sum:checksums.sha256")
   echo "    SHA-256 (sha256sum)..." >&2
 
-  # Count total parts
   local total_parts
   total_parts=$(ls "$dir"/model.tar.part* 2>/dev/null | wc -l)
   local total_jobs=$(( total_parts * ${#hash_cmds[@]} ))
@@ -70,7 +107,6 @@ generate_checksums() {
       for pid in "${file_pids[@]}"; do
         wait "$pid"
       done
-      # Assemble results in sorted order
       cat "$tmpdir"/${cmd}_model.tar.part* | sort -k2 > "$outfile"
     ) &
     pids+=($!)
@@ -98,33 +134,36 @@ generate_checksums() {
 
 show_help() {
   cat <<EOF
-ModelCar Builder - package HuggingFace models as OCI images for RHOAI
+ModelCar Builder - package HuggingFace models and datasets as OCI images
 
 Usage: ./build.sh <command>
 
 Commands:
   all       Run the full pipeline (download -> build -> archive)
-  download  Download model weights into models/
-  build     Build the ModelCar OCI image from models/
-            Optional flag: ./build.sh build --single-layer
-  archive   Move models/ into models_archive/<model-slug>/
-  restore   Move weights from models_archive/ back into models/
-            Optionally pass a path: ./build.sh restore models_archive/<dir>
-  save      Save the image as split tar files for air-gapped transfer
-            Optionally pass an image tag: ./build.sh save <image:tag>
+  download  Download model weights or dataset into staging directory
+  build     Build the OCI image from staged files
+              Optional flag: ./build.sh build --single-layer
+  archive   Move staged files into archive directory
+  restore   Move files from archive back into staging directory
+              Optionally pass a path: ./build.sh restore <archive-dir>
+  clean     Delete all files from staging directory
+  convert   Convert parquet files to JSONL (datasets only)
+  save      Save an image as split tar files for air-gapped transfer
+              Optionally pass an image tag: ./build.sh save <image:tag>
   rehash    Regenerate checksums for a save directory
-            Optionally pass a path: ./build.sh rehash save/<dir>
-  clean     Delete all downloaded weights from models/
+              Optionally pass a path: ./build.sh rehash save/<dir>
   status    Show current configuration and state
 
 Configuration:
-  Edit MODEL_REPO, HF_TOKEN, and SPLIT_SIZE at the top of this script.
+  Set ONE of MODEL_REPO or DATASET_REPO at the top of this script.
 
-  MODEL_REPO  $MODEL_REPO
-  HF_TOKEN    $TOKEN_STATUS
-  IMAGE_TAG   $IMAGE_TAG
-  SPLIT_SIZE  $SPLIT_SIZE
-  RUNTIME     $RUNTIME
+  MODE          $MODE
+  MODEL_REPO    ${MODEL_REPO:-(not set)}
+  DATASET_REPO  ${DATASET_REPO:-(not set)}
+  HF_TOKEN      $TOKEN_STATUS
+  IMAGE_TAG     ${IMAGE_TAG:-(not set)}
+  SPLIT_SIZE    $SPLIT_SIZE
+  RUNTIME       $RUNTIME
 
 Override the image tag:
   IMAGE_TAG=my-model:v1 ./build.sh all
@@ -132,10 +171,15 @@ EOF
 }
 
 cmd_download() {
-  if [ -n "$(find models -mindepth 1 -not -name '.gitkeep' 2>/dev/null)" ]; then
-    echo "==> Error: models/ is not empty."
-    echo "    Run './build.sh clean' or './build.sh archive' first."
-    exit 1
+  require_repo
+
+  if [ -n "$(find "$WORK_DIR" -mindepth 1 -not -name '.gitkeep' 2>/dev/null)" ]; then
+    echo "==> Warning: $WORK_DIR/ is not empty."
+    read -rp "    Resume previous download? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo "    Aborting. Run './build.sh clean' to start fresh."
+      exit 1
+    fi
   fi
 
   if $RUNTIME image exists modelcar-downloader:latest 2>/dev/null || $RUNTIME image inspect modelcar-downloader:latest &>/dev/null; then
@@ -148,26 +192,100 @@ cmd_download() {
   local vol_suffix=""
   [ "$RUNTIME" = "podman" ] && vol_suffix=":Z"
 
+  local repo_type="model"
+  local output_dir="/models"
+  if [ "$MODE" = "dataset" ]; then
+    repo_type="dataset"
+    output_dir="/datasets"
+  fi
+
   echo ""
-  echo "==> Downloading model weights (token: $TOKEN_STATUS)..."
+  echo "==> Downloading $MODE: $REPO_ID (token: $TOKEN_STATUS)..."
   $RUNTIME run --rm -it \
-    -v "$(pwd)/models:/models${vol_suffix}" \
-    -e "MODEL_REPO=$MODEL_REPO" \
+    -v "$(pwd)/$WORK_DIR:${output_dir}${vol_suffix}" \
+    -e "REPO_ID=$REPO_ID" \
+    -e "OUTPUT_DIR=$output_dir" \
+    -e "REPO_TYPE=$repo_type" \
     -e "HF_TOKEN=$HF_TOKEN" \
     -e "HF_HUB_ENABLE_HF_TRANSFER=1" \
     -e "PYTHONUNBUFFERED=1" \
     modelcar-downloader:latest
 }
 
+cmd_convert() {
+  if [ "$MODE" != "dataset" ]; then
+    echo "==> Error: Convert is only for datasets."
+    exit 1
+  fi
+
+  if [ -z "$(find "$WORK_DIR" -name '*.parquet' 2>/dev/null)" ]; then
+    echo "==> No parquet files found in $WORK_DIR/, skipping conversion."
+    return 0
+  fi
+
+  if $RUNTIME image exists modelcar-downloader:latest 2>/dev/null || $RUNTIME image inspect modelcar-downloader:latest &>/dev/null; then
+    : # image exists
+  else
+    echo "==> Building downloader image..."
+    $RUNTIME build -f Containerfile.download -t modelcar-downloader:latest .
+  fi
+
+  local vol_suffix=""
+  [ "$RUNTIME" = "podman" ] && vol_suffix=":Z"
+
+  echo "==> Converting parquet files to JSONL..."
+  $RUNTIME run --rm -it \
+    -v "$(pwd)/$WORK_DIR:/datasets${vol_suffix}" \
+    -e "INPUT_DIR=/datasets" \
+    -e "OUTPUT_DIR=/datasets" \
+    -e "REMOVE_PARQUET=1" \
+    -e "PYTHONUNBUFFERED=1" \
+    --entrypoint python \
+    modelcar-downloader:latest \
+    /app/convert_parquet.py
+}
+
 cmd_build() {
+  require_repo
+
   local single_layer=0
   if [ "${1:-}" = "--single-layer" ]; then
     single_layer=1
     IMAGE_TAG="${IMAGE_TAG%-single}-single"
-    echo "==> Generating Containerfile (single layer)..."
+    echo "==> Generating Containerfile ($MODE, single layer)..."
   else
-    echo "==> Generating Containerfile..."
+    echo "==> Generating Containerfile ($MODE)..."
   fi
+
+  if [ "$MODE" = "model" ]; then
+    _build_model "$single_layer"
+  else
+    _build_dataset
+  fi
+
+  echo ""
+  echo "-- Generated Containerfile ---------------------------------"
+  cat Containerfile
+  echo "------------------------------------------------------------"
+  echo ""
+
+  echo "==> Building image: $IMAGE_TAG"
+  if [ "$RUNTIME" = "podman" ]; then
+    $RUNTIME build --format=oci -t "$IMAGE_TAG" .
+  else
+    $RUNTIME build -t "$IMAGE_TAG" .
+  fi
+
+  rm -f Containerfile
+
+  # Build tokenizer image for models
+  if [ "$MODE" = "model" ]; then
+    _build_tokenizer
+  fi
+}
+
+_build_model() {
+  local single_layer="$1"
 
   {
     echo "FROM registry.access.redhat.com/ubi9/ubi-micro:latest"
@@ -218,23 +336,77 @@ cmd_build() {
     echo "# nobody user"
     echo "USER 65534"
   } > Containerfile
+}
 
-  echo ""
-  echo "-- Generated Containerfile ---------------------------------"
-  cat Containerfile
-  echo "------------------------------------------------------------"
-  echo ""
+_build_dataset() {
+  {
+    echo "FROM registry.access.redhat.com/ubi9/ubi-micro:latest"
+    echo ""
 
-  echo "==> Building ModelCar image: $IMAGE_TAG"
-  if [ "$RUNTIME" = "podman" ]; then
-    $RUNTIME build --format=oci -t "$IMAGE_TAG" .
-  else
-    $RUNTIME build -t "$IMAGE_TAG" .
-  fi
+    # Top-level small files (not parquet/jsonl)
+    local top_small
+    top_small=$(find datasets -maxdepth 1 -type f -not -name '*.parquet' -not -name '*.jsonl' -not -name '.gitkeep' -not -name '*.metadata' -not -name '*.lock' 2>/dev/null)
+    if [ -n "$top_small" ]; then
+      echo "# Dataset metadata"
+      local flist=""
+      for f in $top_small; do
+        flist="$flist $f"
+      done
+      echo "COPY --chown=0:0 --chmod=555$flist /datasets/"
+      echo ""
+    fi
 
-  rm -f Containerfile
+    # Subdirectories
+    local subdirs
+    subdirs=$(find datasets -mindepth 1 -maxdepth 1 -type d -not -name '.cache' -not -name 'download' 2>/dev/null)
+    if [ -n "$subdirs" ]; then
+      for dir in $subdirs; do
+        local dirname
+        dirname=$(basename "$dir")
 
-  # Build tokenizer-only image
+        # Small files in subdirectory
+        local other_files
+        other_files=$(find "$dir" -maxdepth 1 -type f -not -name '*.parquet' -not -name '*.jsonl' -not -name '*.metadata' -not -name '*.lock' 2>/dev/null)
+        if [ -n "$other_files" ]; then
+          echo "# $dirname/ metadata"
+          local ofiles=""
+          for f in $other_files; do
+            ofiles="$ofiles $f"
+          done
+          echo "COPY --chown=0:0 --chmod=555$ofiles /datasets/$dirname/"
+          echo ""
+        fi
+
+        # Large data files in subdirectory (jsonl or parquet, one layer each)
+        local data_files
+        data_files=$(find "$dir" -maxdepth 1 \( -name '*.jsonl' -o -name '*.parquet' \) -printf '%f\n' | sort)
+        if [ -n "$data_files" ]; then
+          echo "# $dirname/ data shards (one layer each)"
+          echo "$data_files" | while read -r df; do
+            echo "COPY --chown=0:0 --chmod=555 datasets/$dirname/$df /datasets/$dirname/$df"
+          done
+          echo ""
+        fi
+      done
+    fi
+
+    # Top-level large data files (jsonl or parquet, one layer each)
+    local top_data
+    top_data=$(find datasets -maxdepth 1 \( -name '*.jsonl' -o -name '*.parquet' \) -printf '%f\n' | sort)
+    if [ -n "$top_data" ]; then
+      echo "# Data shards (one layer each)"
+      echo "$top_data" | while read -r df; do
+        echo "COPY --chown=0:0 --chmod=555 datasets/$df /datasets/$df"
+      done
+      echo ""
+    fi
+
+    echo "# nobody user"
+    echo "USER 65534"
+  } > Containerfile
+}
+
+_build_tokenizer() {
   local tokenizer_tag="${IMAGE_TAG}-tokenizer"
   local tokenizer_files=""
   for f in models/tokenizer.json models/tokenizer_config.json models/config.json; do
@@ -270,14 +442,18 @@ cmd_build() {
 }
 
 cmd_archive() {
-  echo "==> Archiving weights to $ARCHIVE_DIR/$MODEL_SLUG/"
-  mkdir -p "$ARCHIVE_DIR/$MODEL_SLUG"
-  mv models/* "$ARCHIVE_DIR/$MODEL_SLUG/" 2>/dev/null || true
-  touch models/.gitkeep
+  require_repo
+
+  echo "==> Archiving $WORK_DIR/ to $ARCHIVE_DIR/$SLUG/"
+  mkdir -p "$ARCHIVE_DIR/$SLUG"
+  mv "$WORK_DIR"/* "$ARCHIVE_DIR/$SLUG/" 2>/dev/null || true
+  touch "$WORK_DIR/.gitkeep"
 }
 
 cmd_restore() {
-  local source_dir="${1:-$ARCHIVE_DIR/$MODEL_SLUG}"
+  require_repo
+
+  local source_dir="${1:-$ARCHIVE_DIR/$SLUG}"
 
   if [ ! -d "$source_dir" ]; then
     echo "==> Error: Directory not found: $source_dir/"
@@ -289,20 +465,27 @@ cmd_restore() {
     exit 1
   fi
 
-  if [ -n "$(find models -mindepth 1 -not -name '.gitkeep' 2>/dev/null)" ]; then
-    echo "==> Error: models/ is not empty."
-    echo "    Run './build.sh clean' or './build.sh archive' first."
+  if [ -n "$(find "$WORK_DIR" -mindepth 1 -not -name '.gitkeep' 2>/dev/null)" ]; then
+    echo "==> Error: $WORK_DIR/ is not empty."
+    echo "    Run './build.sh clean' first."
     exit 1
   fi
 
-  echo "==> Restoring weights from $source_dir/ to models/"
-  mv "$source_dir"/* models/
+  echo "==> Restoring from $source_dir/ to $WORK_DIR/"
+  mv "$source_dir"/* "$WORK_DIR"/
   rmdir "$source_dir"
-  echo "==> Done. $(find models -type f -not -name '.gitkeep' | wc -l) files restored."
+  echo "==> Done. $(find "$WORK_DIR" -type f -not -name '.gitkeep' | wc -l) files restored."
 }
 
 cmd_save() {
   local save_tag="${1:-$IMAGE_TAG}"
+
+  if [ -z "$save_tag" ]; then
+    echo "==> Error: No image tag specified and none derived from config."
+    echo "    Usage: ./build.sh save <image:tag>"
+    exit 1
+  fi
+
   local save_slug
   save_slug=$(echo "$save_tag" | tr '[:upper:]' '[:lower:]' | sed 's|[/:]|--|g')
   local output_dir="save/${save_slug}"
@@ -321,7 +504,6 @@ cmd_save() {
   echo "==> Output:       $output_dir/"
   echo ""
 
-  # Build save command based on runtime
   local save_cmd
   if [ "$RUNTIME" = "podman" ]; then
     save_cmd="$RUNTIME save --format=oci-archive $save_tag"
@@ -329,7 +511,6 @@ cmd_save() {
     save_cmd="$RUNTIME save $save_tag"
   fi
 
-  # Get image size for progress bar
   local image_size
   image_size=$($RUNTIME image inspect "$save_tag" --format '{{.Size}}' 2>/dev/null || echo "0")
 
@@ -361,7 +542,6 @@ else
 fi
 
 verify() {
-  # Detect checksum file and matching tool
   local checksum_file hash_cmd
   if [ -f checksums.b2 ] && command -v b2sum &>/dev/null; then
     checksum_file="checksums.b2"
@@ -384,7 +564,6 @@ verify() {
   echo "==> Verifying checksums ($hash_cmd, $total_parts parts)..."
   echo ""
 
-  # Hash all parts in parallel and store results
   local tmpdir
   tmpdir=$(mktemp -d)
   trap 'rm -rf "$tmpdir"' RETURN
@@ -411,14 +590,12 @@ verify() {
   done
   printf "\r    Hashing: %d/%d parts complete\n" "$total_parts" "$total_parts" >&2
 
-  # Wait for all hashing to complete
   for pid in "${pids[@]}"; do
     wait "$pid"
   done
 
   echo "" >&2
 
-  # Compare results
   local failed=0
   local total=0
 
@@ -508,7 +685,7 @@ LOAD
   echo "    Transfer all files in $output_dir/ to the air-gapped host,"
   echo "    then run ./load.sh to verify and load the image."
 
-  # Auto-save tokenizer image if it exists
+  # Auto-save tokenizer image if it exists (model mode only)
   local tokenizer_tag="${save_tag}-tokenizer"
   if $RUNTIME image inspect "$tokenizer_tag" &>/dev/null; then
     echo ""
@@ -526,7 +703,6 @@ LOAD
     echo "==> Generating checksums..."
     generate_checksums "$tokenizer_dir"
 
-    # Write load.sh for tokenizer
     cat > "${tokenizer_dir}/load.sh" <<'TLOAD'
 #!/bin/bash
 set -euo pipefail
@@ -563,14 +739,12 @@ cmd_rehash() {
   }
 
   if [ -n "$target" ]; then
-    # Rehash a specific directory
     if [ ! -d "$target" ] || ! ls "$target"/model.tar.part* &>/dev/null; then
       echo "==> Error: No parts found in $target/"
       exit 1
     fi
     rehash_dir "$target"
   else
-    # Rehash all save directories
     local found=0
     for dir in save/*/; do
       if [ -d "$dir" ] && ls "$dir"/model.tar.part* &>/dev/null; then
@@ -588,19 +762,23 @@ cmd_rehash() {
 }
 
 cmd_clean() {
-  echo "==> Cleaning models directory..."
-  find models -mindepth 1 -not -name '.gitkeep' -delete 2>/dev/null || true
+  require_repo
+
+  echo "==> Cleaning $WORK_DIR/..."
+  find "$WORK_DIR" -mindepth 1 -not -name '.gitkeep' -delete 2>/dev/null || true
   echo "==> Done."
 }
 
 cmd_status() {
   echo "==> Configuration"
-  echo "    MODEL_REPO:  $MODEL_REPO"
-  echo "    HF_TOKEN:    $TOKEN_STATUS"
-  echo "    IMAGE_TAG:   $IMAGE_TAG"
-  echo "    MODEL_SLUG:  $MODEL_SLUG"
-  echo "    SPLIT_SIZE:  $SPLIT_SIZE"
-  echo "    RUNTIME:     $RUNTIME"
+  echo "    MODE:          $MODE"
+  echo "    MODEL_REPO:    ${MODEL_REPO:-(not set)}"
+  echo "    DATASET_REPO:  ${DATASET_REPO:-(not set)}"
+  echo "    HF_TOKEN:      $TOKEN_STATUS"
+  echo "    IMAGE_TAG:     ${IMAGE_TAG:-(not set)}"
+  echo "    SLUG:          ${SLUG:-(not set)}"
+  echo "    SPLIT_SIZE:    $SPLIT_SIZE"
+  echo "    RUNTIME:       $RUNTIME"
   echo ""
 
   echo "==> models/"
@@ -614,9 +792,33 @@ cmd_status() {
   fi
   echo ""
 
+  echo "==> datasets/"
+  if [ -z "$(find datasets -mindepth 1 -not -name '.gitkeep' 2>/dev/null)" ]; then
+    echo "    (empty)"
+  else
+    local count size
+    count=$(find datasets -type f -not -name '.gitkeep' -not -name '*.metadata' -not -name '*.lock' | wc -l)
+    size=$(du -sh datasets 2>/dev/null | cut -f1)
+    echo "    $count files, $size total"
+  fi
+  echo ""
+
   echo "==> models_archive/"
-  if [ -d "$ARCHIVE_DIR" ] && [ -n "$(ls -A "$ARCHIVE_DIR" 2>/dev/null)" ]; then
-    for dir in "$ARCHIVE_DIR"/*/; do
+  if [ -d "models_archive" ] && [ -n "$(ls -A "models_archive" 2>/dev/null)" ]; then
+    for dir in models_archive/*/; do
+      local slug size
+      slug=$(basename "$dir")
+      size=$(du -sh "$dir" 2>/dev/null | cut -f1)
+      echo "    $slug ($size)"
+    done
+  else
+    echo "    (empty)"
+  fi
+  echo ""
+
+  echo "==> datasets_archive/"
+  if [ -d "datasets_archive" ] && [ -n "$(ls -A "datasets_archive" 2>/dev/null)" ]; then
+    for dir in datasets_archive/*/; do
       local slug size
       slug=$(basename "$dir")
       size=$(du -sh "$dir" 2>/dev/null | cut -f1)
@@ -642,13 +844,21 @@ cmd_status() {
 }
 
 cmd_all() {
-  echo "==> Model:   $MODEL_REPO"
+  require_repo
+
+  echo "==> Mode:    $MODE"
+  echo "==> Repo:    $REPO_ID"
   echo "==> Image:   $IMAGE_TAG"
   echo "==> Token:   $TOKEN_STATUS"
   echo "==> Runtime: $RUNTIME"
   echo ""
 
   cmd_download
+
+  if [ "$MODE" = "dataset" ]; then
+    echo ""
+    cmd_convert
+  fi
 
   echo ""
   cmd_build
@@ -658,15 +868,15 @@ cmd_all() {
 
   echo ""
   echo "==> Done."
-  echo "    Image:     $IMAGE_TAG"
-  echo "    Tokenizer: ${IMAGE_TAG}-tokenizer"
-  echo "    Weights:   $ARCHIVE_DIR/$MODEL_SLUG/"
+  echo "    Image:   $IMAGE_TAG"
+  if [ "$MODE" = "model" ]; then
+    echo "    Tokenizer: ${IMAGE_TAG}-tokenizer"
+  fi
+  echo "    Archive: $ARCHIVE_DIR/$SLUG/"
   echo ""
   echo "    Next steps:"
   echo "      $RUNTIME tag $IMAGE_TAG <your-registry>/$IMAGE_TAG"
   echo "      $RUNTIME push <your-registry>/$IMAGE_TAG"
-  echo "      $RUNTIME tag ${IMAGE_TAG}-tokenizer <your-registry>/${IMAGE_TAG}-tokenizer"
-  echo "      $RUNTIME push <your-registry>/${IMAGE_TAG}-tokenizer"
   echo ""
   echo "    For air-gapped transfer:"
   echo "      ./build.sh save"
@@ -674,17 +884,13 @@ cmd_all() {
 
 # -- Main -------------------------------------------------------
 
-if [ -z "$MODEL_REPO" ]; then
-  echo "Error: MODEL_REPO is not set."
-  exit 1
-fi
-
 case "${1:-}" in
   all)      cmd_all      ;;
   download) cmd_download ;;
   build)    cmd_build "${2:-}" ;;
   archive)  cmd_archive  ;;
   restore)  cmd_restore "${2:-}" ;;
+  convert)  cmd_convert  ;;
   save)     cmd_save "${2:-}" ;;
   rehash)   cmd_rehash "${2:-}" ;;
   clean)    cmd_clean    ;;
