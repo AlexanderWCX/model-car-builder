@@ -10,7 +10,7 @@ HF_TOKEN=""
 SPLIT_SIZE="4G"
 # ---------------------------------------------------------------
 
-# -- Mode detection ---------------------------------------------S
+# -- Mode detection ---------------------------------------------
 if [ -n "$MODEL_REPO" ] && [ -n "$DATASET_REPO" ]; then
   echo "Error: Both MODEL_REPO and DATASET_REPO are set. Set only one at a time."
   exit 1
@@ -506,7 +506,7 @@ cmd_save() {
 
   local save_cmd
   if [ "$RUNTIME" = "podman" ]; then
-    save_cmd="$RUNTIME save --format=oci-archive $save_tag"
+    save_cmd="$RUNTIME save --format=docker-archive $save_tag"
   else
     save_cmd="$RUNTIME save $save_tag"
   fi
@@ -695,7 +695,7 @@ LOAD
     mkdir -p "$tokenizer_dir"
 
     if [ "$RUNTIME" = "podman" ]; then
-      $RUNTIME save --format=oci-archive "$tokenizer_tag" > "${tokenizer_dir}/model.tar.part00"
+      $RUNTIME save --format=docker-archive "$tokenizer_tag" > "${tokenizer_dir}/model.tar.part00"
     else
       $RUNTIME save "$tokenizer_tag" > "${tokenizer_dir}/model.tar.part00"
     fi
@@ -762,8 +762,6 @@ cmd_rehash() {
 }
 
 cmd_clean() {
-  require_repo
-
   echo "==> Cleaning $WORK_DIR/..."
   find "$WORK_DIR" -mindepth 1 -not -name '.gitkeep' -delete 2>/dev/null || true
   echo "==> Done."
