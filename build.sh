@@ -150,6 +150,7 @@ Commands:
   convert   Convert parquet files to JSONL (datasets only)
   save      Save an image as split tar files for air-gapped transfer
               Optionally pass an image tag: ./build.sh save <image:tag>
+              Force docker as the runtime:  ./build.sh save --docker <image:tag>
   rehash    Regenerate checksums for a save directory
               Optionally pass a path: ./build.sh rehash save/<dir>
   status    Show current configuration and state
@@ -478,11 +479,36 @@ cmd_restore() {
 }
 
 cmd_save() {
-  local save_tag="${1:-$IMAGE_TAG}"
+  local save_tag=""
+  local save_runtime="$RUNTIME"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --docker)
+        if ! command -v docker &>/dev/null; then
+          echo "==> Error: --docker requested but docker is not installed."
+          exit 1
+        fi
+        save_runtime="docker"
+        ;;
+      *)
+        if [ -z "$save_tag" ]; then
+          save_tag="$1"
+        else
+          echo "==> Error: Unexpected argument: $1"
+          echo "    Usage: ./build.sh save [--docker] [<image:tag>]"
+          exit 1
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  save_tag="${save_tag:-$IMAGE_TAG}"
 
   if [ -z "$save_tag" ]; then
     echo "==> Error: No image tag specified and none derived from config."
-    echo "    Usage: ./build.sh save <image:tag>"
+    echo "    Usage: ./build.sh save [--docker] <image:tag>"
     exit 1
   fi
 
@@ -500,19 +526,19 @@ cmd_save() {
 
   echo "==> Saving image: $save_tag"
   echo "==> Split size:   $SPLIT_SIZE"
-  echo "==> Runtime:      $RUNTIME"
+  echo "==> Runtime:      $save_runtime"
   echo "==> Output:       $output_dir/"
   echo ""
 
   local save_cmd
-  if [ "$RUNTIME" = "podman" ]; then
-    save_cmd="$RUNTIME save --format=docker-archive $save_tag"
+  if [ "$save_runtime" = "podman" ]; then
+    save_cmd="$save_runtime save --format=docker-archive $save_tag"
   else
-    save_cmd="$RUNTIME save $save_tag"
+    save_cmd="$save_runtime save $save_tag"
   fi
 
   local image_size
-  image_size=$($RUNTIME image inspect "$save_tag" --format '{{.Size}}' 2>/dev/null || echo "0")
+  image_size=$($save_runtime image inspect "$save_tag" --format '{{.Size}}' 2>/dev/null || echo "0")
 
   if command -v pv &>/dev/null && [ "$image_size" -gt 0 ]; then
     $save_cmd | pv -s "$image_size" | split -b "$SPLIT_SIZE" -d - "${output_dir}/model.tar.part"
@@ -687,17 +713,17 @@ LOAD
 
   # Auto-save tokenizer image if it exists (model mode only)
   local tokenizer_tag="${save_tag}-tokenizer"
-  if $RUNTIME image inspect "$tokenizer_tag" &>/dev/null; then
+  if $save_runtime image inspect "$tokenizer_tag" &>/dev/null; then
     echo ""
     echo "==> Tokenizer image found, saving: $tokenizer_tag"
     local tokenizer_slug="${save_slug}-tokenizer"
     local tokenizer_dir="save/${tokenizer_slug}"
     mkdir -p "$tokenizer_dir"
 
-    if [ "$RUNTIME" = "podman" ]; then
-      $RUNTIME save --format=docker-archive "$tokenizer_tag" > "${tokenizer_dir}/model.tar.part00"
+    if [ "$save_runtime" = "podman" ]; then
+      $save_runtime save --format=docker-archive "$tokenizer_tag" > "${tokenizer_dir}/model.tar.part00"
     else
-      $RUNTIME save "$tokenizer_tag" > "${tokenizer_dir}/model.tar.part00"
+      $save_runtime save "$tokenizer_tag" > "${tokenizer_dir}/model.tar.part00"
     fi
 
     echo "==> Generating checksums..."
@@ -889,7 +915,7 @@ case "${1:-}" in
   archive)  cmd_archive  ;;
   restore)  cmd_restore "${2:-}" ;;
   convert)  cmd_convert  ;;
-  save)     cmd_save "${2:-}" ;;
+  save)     shift; cmd_save "$@" ;;
   rehash)   cmd_rehash "${2:-}" ;;
   clean)    cmd_clean    ;;
   status)   cmd_status   ;;
