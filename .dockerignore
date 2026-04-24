@@ -1,0 +1,8 @@
+models_archive/
+save/
+.git/
+models/.cache/
+models/download/
+models/*.metadata
+models/*.lock
+models/.gitkeep

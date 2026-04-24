@@ -58,8 +58,10 @@ Commands:
   restore   Move files from archive back into staging directory
               Optionally pass a path: ./build.sh restore <archive-dir>
   clean     Delete all files from staging directory
+  convert   Convert parquet files to JSONL (datasets only)
   save      Save an image as split tar files for air-gapped transfer
               Optionally pass an image tag: ./build.sh save <image:tag>
+              Force docker as the runtime:  ./build.sh save --docker <image:tag>
   rehash    Regenerate checksums for a save directory
               Optionally pass a path: ./build.sh rehash save/<dir>
   status    Show current configuration and state
@@ -164,13 +166,20 @@ To regenerate checksums for existing save directories:
 
 The `save` and `load` scripts auto-detect Podman or Docker. Images saved with Docker can be loaded with Podman and vice versa.
 
-Note: When Podman is detected, `save` uses `--format=oci-archive` (supports zstd-compressed layers). When Docker is detected, it uses the default Docker archive format. Both formats are loadable by both runtimes.
+When Podman is detected, `save` uses `--format=docker-archive` (the only format `docker load` accepts). When Docker is detected, it uses the default Docker archive format. Both produce archives loadable by both runtimes.
+
+If you need to force docker as the save runtime (e.g. podman is installed but you want a docker-native archive), pass `--docker`:
+
+```bash
+./build.sh save --docker
+./build.sh save --docker <image:tag>
+```
 
 ### Using podman/docker directly
 
 ```bash
 # Internet-connected side
-podman save --format=oci-archive -o model.tar <image-name>:<tag>
+podman save --format=docker-archive -o model.tar <image-name>:<tag>
 
 # Sneakernet the tar file across
 
@@ -251,20 +260,23 @@ spec:
 .
 |-- build.sh                   # Main script: download, build, archive, save, rehash, etc.
 |-- Containerfile              # Generated at build time (one layer per shard)
-|-- Containerfile.download     # Downloader image (Python + huggingface-hub + hf_transfer)
+|-- Containerfile.download     # Downloader image (Python + huggingface-hub + hf_transfer + pandas)
 |-- download_model.py          # Download script (supports models and datasets)
+|-- convert_parquet.py         # Parquet-to-JSONL converter (datasets only)
 |-- models/                    # Model weight staging area (gitignored except .gitkeep)
 |   +-- .gitkeep
 |-- datasets/                  # Dataset staging area (gitignored except .gitkeep)
 |   +-- .gitkeep
 |-- models_archive/            # Archived model weights (gitignored)
+|-- datasets_archive/          # Archived datasets (gitignored)
 |-- save/                      # Split image tarballs for air-gapped transfer (gitignored)
 |   +-- <model-slug>/
 |       |-- checksums.b2       # BLAKE2 checksums (if b2sum available)
 |       |-- checksums.sha256   # SHA-256 checksums
 |       |-- load.sh            # Self-contained verify/assemble/load script
 |       +-- model.tar.part*    # Split image parts
-|-- .containerignore           # Excludes archive/save/cache dirs from build context
+|-- .containerignore           # Build context excludes (podman)
+|-- .dockerignore              # Build context excludes (docker) -- kept in sync with .containerignore
 |-- .gitignore
 +-- README.md
 ```

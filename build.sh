@@ -272,9 +272,9 @@ cmd_build() {
 
   echo "==> Building image: $IMAGE_TAG"
   if [ "$RUNTIME" = "podman" ]; then
-    $RUNTIME build --format=oci -t "$IMAGE_TAG" .
+    $RUNTIME build --format=oci -f Containerfile -t "$IMAGE_TAG" .
   else
-    $RUNTIME build -t "$IMAGE_TAG" .
+    $RUNTIME build -f Containerfile -t "$IMAGE_TAG" .
   fi
 
   rm -f Containerfile
@@ -430,9 +430,9 @@ _build_tokenizer() {
     } > Containerfile
 
     if [ "$RUNTIME" = "podman" ]; then
-      $RUNTIME build --format=oci -t "$tokenizer_tag" .
+      $RUNTIME build --format=oci -f Containerfile -t "$tokenizer_tag" .
     else
-      $RUNTIME build -t "$tokenizer_tag" .
+      $RUNTIME build -f Containerfile -t "$tokenizer_tag" .
     fi
 
     rm -f Containerfile
