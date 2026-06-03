@@ -8,6 +8,10 @@ MODEL_REPO=""
 DATASET_REPO=""
 HF_TOKEN=""
 SPLIT_SIZE="4G"
+# Max size per safetensors shard (each shard becomes one OCI layer). Keeps layers
+# under the registry's per-layer cap (e.g. Quay MAXIMUM_LAYER_SIZE, default 20G)
+# and keeps parallel pulls effective. Set empty or "0" to disable. Units: G/M.
+MAX_SHARD_SIZE="4G"
 # ---------------------------------------------------------------
 
 # -- Mode detection ---------------------------------------------
@@ -143,6 +147,9 @@ Commands:
   download  Download model weights or dataset into staging directory
   build     Build the OCI image from staged files
               Optional flag: ./build.sh build --single-layer
+              (models are auto-resharded first unless MAX_SHARD_SIZE is empty)
+  reshard   Re-split oversized safetensors so each shard <= MAX_SHARD_SIZE
+              (regenerates model.safetensors.index.json; models only)
   archive   Move staged files into archive directory
   restore   Move files from archive back into staging directory
               Optionally pass a path: ./build.sh restore <archive-dir>
@@ -164,6 +171,7 @@ Configuration:
   HF_TOKEN      $TOKEN_STATUS
   IMAGE_TAG     ${IMAGE_TAG:-(not set)}
   SPLIT_SIZE    $SPLIT_SIZE
+  MAX_SHARD_SIZE ${MAX_SHARD_SIZE:-(disabled)}
   RUNTIME       $RUNTIME
 
 Override the image tag:
@@ -246,6 +254,59 @@ cmd_convert() {
     /app/convert_parquet.py
 }
 
+cmd_reshard() {
+  require_repo
+
+  if [ "$MODE" != "model" ]; then
+    echo "==> Reshard is only for models, skipping."
+    return 0
+  fi
+
+  local has_staging=0
+  [ -d "$WORK_DIR/.reshard-staging" ] && has_staging=1
+
+  local shard_size="${MAX_SHARD_SIZE:-0}"
+  [ -z "$shard_size" ] && shard_size=0
+
+  # Skip only when resharding is disabled AND there is nothing to recover. An
+  # interrupted reshard must always be resolved (it may have left models/ in a
+  # half-committed state), so a leftover staging dir forces the container to run
+  # even with resharding disabled.
+  if [ "$shard_size" = "0" ] && [ "$has_staging" -eq 0 ]; then
+    echo "==> MAX_SHARD_SIZE disabled, skipping reshard."
+    return 0
+  fi
+
+  if [ -z "$(find "$WORK_DIR" -maxdepth 1 -name '*.safetensors' 2>/dev/null)" ] && [ "$has_staging" -eq 0 ]; then
+    echo "==> No safetensors in $WORK_DIR/, skipping reshard."
+    return 0
+  fi
+
+  if $RUNTIME image exists modelcar-downloader:latest 2>/dev/null || $RUNTIME image inspect modelcar-downloader:latest &>/dev/null; then
+    : # image exists
+  else
+    echo "==> Building downloader image..."
+    $RUNTIME build -f Containerfile.download -t modelcar-downloader:latest .
+  fi
+
+  local vol_suffix=""
+  [ "$RUNTIME" = "podman" ] && vol_suffix=":Z"
+
+  if [ "$shard_size" = "0" ]; then
+    echo "==> Recovering interrupted reshard (resharding disabled)..."
+  else
+    echo "==> Resharding safetensors to <= $shard_size per shard..."
+  fi
+  $RUNTIME run --rm \
+    -v "$(pwd)/$WORK_DIR:/models${vol_suffix}" \
+    -e "MODELS_DIR=/models" \
+    -e "MAX_SHARD_SIZE=$shard_size" \
+    -e "PYTHONUNBUFFERED=1" \
+    --entrypoint python \
+    modelcar-downloader:latest \
+    /app/reshard_safetensors.py
+}
+
 cmd_build() {
   require_repo
 
@@ -256,6 +317,21 @@ cmd_build() {
     echo "==> Generating Containerfile ($MODE, single layer)..."
   else
     echo "==> Generating Containerfile ($MODE)..."
+  fi
+
+  # Re-shard oversized safetensors before building so no single layer exceeds the
+  # registry's per-layer limit. --single-layer is one layer by design so it never
+  # splits, but it must still resolve a half-committed reshard left by a prior
+  # interrupted run (otherwise that partial state gets baked into the image).
+  if [ "$MODE" = "model" ]; then
+    if [ "$single_layer" -eq 0 ]; then
+      cmd_reshard
+      echo ""
+    elif [ -d "$WORK_DIR/.reshard-staging" ]; then
+      echo "==> Resolving an interrupted reshard before the single-layer build..."
+      ( MAX_SHARD_SIZE=0; cmd_reshard )
+      echo ""
+    fi
   fi
 
   if [ "$MODE" = "model" ]; then
@@ -311,7 +387,7 @@ _build_model() {
 
       # Subdirectories (e.g. 1_Pooling/, 2_Dense/)
       local subdirs
-      subdirs=$(find models -mindepth 1 -maxdepth 1 -type d -not -name '.cache' -not -name 'download' 2>/dev/null)
+      subdirs=$(find models -mindepth 1 -maxdepth 1 -type d -not -name '.cache' -not -name 'download' -not -name '.reshard-staging' 2>/dev/null)
       if [ -n "$subdirs" ]; then
         echo "# Model subdirectories"
         for dir in $subdirs; do

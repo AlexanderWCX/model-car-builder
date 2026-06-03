@@ -54,6 +54,9 @@ Commands:
   download  Download model weights or dataset into staging directory
   build     Build the OCI image from staged files
               Optional flag: ./build.sh build --single-layer
+              (models are auto-resharded first unless MAX_SHARD_SIZE is empty)
+  reshard   Re-split oversized safetensors so each shard <= MAX_SHARD_SIZE
+              (regenerates model.safetensors.index.json; models only)
   archive   Move staged files into archive directory
   restore   Move files from archive back into staging directory
               Optionally pass a path: ./build.sh restore <archive-dir>
@@ -75,7 +78,8 @@ Each step can be run independently:
 
 ```bash
 ./build.sh download                 # download model/dataset
-./build.sh build                    # build OCI image (per-shard layers)
+./build.sh reshard                  # re-split oversized safetensors (≤ MAX_SHARD_SIZE)
+./build.sh build                    # build OCI image (per-shard layers; auto-reshards first)
 ./build.sh build --single-layer     # build OCI image (single layer)
 ./build.sh archive                  # move staged files to archive
 ./build.sh restore                  # move files back from archive
@@ -93,6 +97,35 @@ The `--single-layer` flag copies all model files in a single `COPY` instruction.
 ./build.sh build                  -> qwen/qwen3-reranker-4b:20260319
 ./build.sh build --single-layer   -> qwen/qwen3-reranker-4b:20260319-single
 ```
+
+### Resharding oversized weights
+
+Each safetensors file becomes its own OCI layer. Some upstream repos pack most of
+their weights into a single huge file (e.g. one ~50 GB shard), which produces one
+giant layer that **exceeds container-registry per-layer limits** — Quay's
+`MAXIMUM_LAYER_SIZE` defaults to `20G` — and also defeats parallel pulls.
+
+Before building (model mode, non `--single-layer`), `build.sh` automatically
+re-splits any oversized safetensors into even shards no larger than
+`MAX_SHARD_SIZE` (default `4G`) and regenerates `model.safetensors.index.json` to
+match. Run it on its own with `./build.sh reshard`.
+
+Details:
+
+- **Lossless & dtype-agnostic.** Weights are repacked at the raw-byte level (no
+  torch/numpy), so bf16/fp8/any dtype is copied verbatim.
+- **Idempotent.** If every shard is already ≤ `MAX_SHARD_SIZE`, it does nothing.
+  A single tensor larger than the target can't be split — it gets its own shard
+  and a warning is printed.
+- **Crash-safe.** New shards are written into a `.reshard-staging/` subdirectory
+  while the originals are left untouched; the swap happens only after a
+  `COMMITTED` marker is in place. An interrupted run either discards the
+  incomplete staging (originals intact) or finishes the commit on the next run.
+  This matters because `restore` *moves* weights out of the archive, so `models/`
+  can be the only copy.
+- **Disk.** The staged copy briefly coexists with the originals, so resharding
+  needs roughly the model's size in additional free space (checked up front).
+- Set `MAX_SHARD_SIZE` empty or `0` to disable resharding entirely.
 
 ### Tokenizer image
 
@@ -262,6 +295,7 @@ spec:
 |-- Containerfile              # Generated at build time (one layer per shard)
 |-- Containerfile.download     # Downloader image (Python + huggingface-hub + hf_transfer + pandas)
 |-- download_model.py          # Download script (supports models and datasets)
+|-- reshard_safetensors.py     # Re-splits oversized safetensors into even shards (crash-safe)
 |-- convert_parquet.py         # Parquet-to-JSONL converter (datasets only)
 |-- models/                    # Model weight staging area (gitignored except .gitkeep)
 |   +-- .gitkeep

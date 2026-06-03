@@ -3,6 +3,7 @@ save/
 .git/
 models/.cache/
 models/download/
+models/.reshard-staging/
 models/*.metadata
 models/*.lock
 models/.gitkeep

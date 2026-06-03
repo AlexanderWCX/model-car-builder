@@ -5,6 +5,7 @@ RUN pip install --no-cache-dir huggingface-hub hf_transfer pandas pyarrow
 
 COPY download_model.py /app/download_model.py
 COPY convert_parquet.py /app/convert_parquet.py
+COPY reshard_safetensors.py /app/reshard_safetensors.py
 WORKDIR /app
 
 ENTRYPOINT ["python", "download_model.py"]

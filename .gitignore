@@ -9,6 +9,10 @@ datasets/*
 # Generated at build time
 Containerfile
 
+# Python bytecode (reshard_safetensors.py is importable)
+__pycache__/
+*.pyc
+
 # Archived weights from previous builds
 models_archive/
 datasets_archive/
