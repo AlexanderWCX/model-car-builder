@@ -523,7 +523,34 @@ cmd_archive() {
 
   echo "==> Archiving $WORK_DIR/ to $ARCHIVE_DIR/$SLUG/"
   mkdir -p "$ARCHIVE_DIR/$SLUG"
-  mv "$WORK_DIR"/* "$ARCHIVE_DIR/$SLUG/" 2>/dev/null || true
+
+  # Move ALL model content -- including hidden files like .gitattributes and
+  # .eval_results, which the build copies into the image. A plain `mv $WORK_DIR/*`
+  # glob skips dotfiles and would leave them behind, producing an incomplete
+  # archive. Keep the placeholder and the transient HF cache / reshard staging
+  # out of the archive. (Best-effort host move first; root-owned dirs fail here.)
+  find "$WORK_DIR" -mindepth 1 -maxdepth 1 \
+    -not -name '.gitkeep' \
+    -not -name '.cache' \
+    -not -name '.reshard-staging' \
+    -exec mv -t "$ARCHIVE_DIR/$SLUG/" {} + 2>/dev/null || true
+  find "$WORK_DIR" -mindepth 1 -not -name '.gitkeep' -delete 2>/dev/null || true
+
+  # The downloader container writes as root, so root-owned directories (e.g.
+  # .eval_results) can't be moved -- and .cache can't be deleted -- by the host
+  # user. If anything but .gitkeep remains, finish the move + cleanup in a root
+  # container (whole repo mounted so moves stay on one filesystem = fast renames).
+  if [ -n "$(find "$WORK_DIR" -mindepth 1 -not -name '.gitkeep' 2>/dev/null)" ]; then
+    if $RUNTIME image inspect modelcar-downloader:latest &>/dev/null; then
+      echo "==> Finishing archive of root-owned content via container..."
+      $RUNTIME run --rm -v "$(pwd):/repo" --entrypoint sh modelcar-downloader:latest -c \
+        "cd /repo && find '$WORK_DIR' -mindepth 1 -maxdepth 1 -not -name .gitkeep -not -name .cache -not -name .reshard-staging -exec mv -t '$ARCHIVE_DIR/$SLUG/' {} + && find '$WORK_DIR' -mindepth 1 -not -name .gitkeep -delete"
+    else
+      echo "==> Warning: root-owned content remains in $WORK_DIR/ and the downloader"
+      echo "    image is unavailable to move it. Rebuild it (or use sudo), then re-run archive."
+    fi
+  fi
+
   touch "$WORK_DIR/.gitkeep"
 }
 
@@ -549,8 +576,25 @@ cmd_restore() {
   fi
 
   echo "==> Restoring from $source_dir/ to $WORK_DIR/"
-  mv "$source_dir"/* "$WORK_DIR"/
-  rmdir "$source_dir"
+  # Move everything back, including hidden model content (.gitattributes,
+  # .eval_results) -- a `mv $source_dir/*` glob skips dotfiles, which would both
+  # lose them and leave the source dir non-empty so the rmdir below fails.
+  # Best-effort host move first; root-owned dirs need a root container (below).
+  find "$source_dir" -mindepth 1 -maxdepth 1 -exec mv -t "$WORK_DIR/" {} + 2>/dev/null || true
+  if [ -n "$(find "$source_dir" -mindepth 1 2>/dev/null)" ]; then
+    case "$source_dir" in
+      /*) : ;;  # absolute/external path: cannot be mapped into the repo mount
+      *)
+        if $RUNTIME image inspect modelcar-downloader:latest &>/dev/null; then
+          echo "==> Restoring root-owned content via container..."
+          $RUNTIME run --rm -v "$(pwd):/repo" --entrypoint sh modelcar-downloader:latest -c \
+            "cd /repo && find '$source_dir' -mindepth 1 -maxdepth 1 -exec mv -t '$WORK_DIR/' {} +"
+        fi
+        ;;
+    esac
+  fi
+  rmdir "$source_dir" 2>/dev/null || \
+    echo "==> Note: $source_dir/ not removed (root-owned leftovers?); files were restored."
   echo "==> Done. $(find "$WORK_DIR" -type f -not -name '.gitkeep' | wc -l) files restored."
 }
 
@@ -866,6 +910,20 @@ cmd_rehash() {
 cmd_clean() {
   echo "==> Cleaning $WORK_DIR/..."
   find "$WORK_DIR" -mindepth 1 -not -name '.gitkeep' -delete 2>/dev/null || true
+
+  # Older downloads (run as root) leave root-owned files under .cache/ that the
+  # host user can't delete. Detect leftovers and remove them via a root container.
+  if [ -n "$(find "$WORK_DIR" -mindepth 1 -not -name '.gitkeep' 2>/dev/null)" ]; then
+    echo "==> Removing root-owned leftovers via container..."
+    if $RUNTIME image inspect modelcar-downloader:latest &>/dev/null; then
+      $RUNTIME run --rm -v "$(pwd)/$WORK_DIR:/work" --entrypoint find \
+        modelcar-downloader:latest /work -mindepth 1 -not -name '.gitkeep' -delete
+    else
+      echo "==> Error: leftovers are root-owned and the downloader image is unavailable."
+      echo "    Run 'sudo rm -rf $WORK_DIR/.cache' or rebuild the downloader image, then retry."
+      exit 1
+    fi
+  fi
   echo "==> Done."
 }
 
@@ -878,6 +936,7 @@ cmd_status() {
   echo "    IMAGE_TAG:     ${IMAGE_TAG:-(not set)}"
   echo "    SLUG:          ${SLUG:-(not set)}"
   echo "    SPLIT_SIZE:    $SPLIT_SIZE"
+  echo "    MAX_SHARD_SIZE: ${MAX_SHARD_SIZE:-(disabled)}"
   echo "    RUNTIME:       $RUNTIME"
   echo ""
 
@@ -988,6 +1047,7 @@ case "${1:-}" in
   all)      cmd_all      ;;
   download) cmd_download ;;
   build)    cmd_build "${2:-}" ;;
+  reshard)  cmd_reshard  ;;
   archive)  cmd_archive  ;;
   restore)  cmd_restore "${2:-}" ;;
   convert)  cmd_convert  ;;
