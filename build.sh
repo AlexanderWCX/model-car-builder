@@ -153,7 +153,8 @@ Commands:
   archive   Move staged files into archive directory
   restore   Move files from archive back into staging directory
               Optionally pass a path: ./build.sh restore <archive-dir>
-  clean     Delete all files from staging directory
+  clean     Delete staged files (defaults to everything)
+              Targets: ./build.sh clean [model|dataset|all]
   convert   Convert parquet files to JSONL (datasets only)
   save      Save an image as split tar files for air-gapped transfer
               Optionally pass an image tag: ./build.sh save <image:tag>
@@ -486,10 +487,23 @@ _build_dataset() {
 _build_tokenizer() {
   local tokenizer_tag="${IMAGE_TAG}-tokenizer"
   local tokenizer_files=""
-  for f in models/tokenizer.json models/tokenizer_config.json models/config.json; do
-    if [ -f "$f" ]; then
-      tokenizer_files="$tokenizer_files $f"
-    fi
+  local found
+  found=$(find models -maxdepth 1 -type f \
+    -not -name '*.safetensors' \
+    -not -name '*.safetensors.index.json' \
+    -not -name '*.bin' \
+    -not -name '*.gguf' \
+    -not -name '*.pt' \
+    -not -name '*.pth' \
+    -not -name '*.onnx' \
+    -not -name '*.msgpack' \
+    -not -name '*.h5' \
+    -not -name '*.ot' \
+    -not -name '.gitkeep' \
+    -not -name '*.metadata' \
+    -not -name '*.lock' 2>/dev/null | sort)
+  for f in $found; do
+    tokenizer_files="$tokenizer_files $f"
   done
 
   if [ -n "$tokenizer_files" ]; then
@@ -498,7 +512,7 @@ _build_tokenizer() {
     {
       echo "FROM registry.access.redhat.com/ubi9/ubi-micro:latest"
       echo ""
-      echo "# Tokenizer files only"
+      echo "# All non-weight files (config, tokenizer, preprocessor, chat template, etc.)"
       echo "COPY --chown=0:0 --chmod=555$tokenizer_files /models/"
       echo ""
       echo "# nobody user"
@@ -907,23 +921,49 @@ cmd_rehash() {
   echo "==> Done."
 }
 
-cmd_clean() {
-  echo "==> Cleaning $WORK_DIR/..."
-  find "$WORK_DIR" -mindepth 1 -not -name '.gitkeep' -delete 2>/dev/null || true
+clean_dir() {
+  local dir="$1"
+  if [ ! -d "$dir" ]; then
+    echo "==> $dir/ does not exist, skipping."
+    return
+  fi
+  if [ -z "$(find "$dir" -mindepth 1 -not -name '.gitkeep' 2>/dev/null)" ]; then
+    echo "==> $dir/ already clean."
+    return
+  fi
+  echo "==> Cleaning $dir/..."
+  find "$dir" -mindepth 1 -not -name '.gitkeep' -delete 2>/dev/null || true
 
   # Older downloads (run as root) leave root-owned files under .cache/ that the
   # host user can't delete. Detect leftovers and remove them via a root container.
-  if [ -n "$(find "$WORK_DIR" -mindepth 1 -not -name '.gitkeep' 2>/dev/null)" ]; then
+  if [ -n "$(find "$dir" -mindepth 1 -not -name '.gitkeep' 2>/dev/null)" ]; then
     echo "==> Removing root-owned leftovers via container..."
     if $RUNTIME image inspect modelcar-downloader:latest &>/dev/null; then
-      $RUNTIME run --rm -v "$(pwd)/$WORK_DIR:/work" --entrypoint find \
+      $RUNTIME run --rm -v "$(pwd)/$dir:/work" --entrypoint find \
         modelcar-downloader:latest /work -mindepth 1 -not -name '.gitkeep' -delete
     else
       echo "==> Error: leftovers are root-owned and the downloader image is unavailable."
-      echo "    Run 'sudo rm -rf $WORK_DIR/.cache' or rebuild the downloader image, then retry."
+      echo "    Run 'sudo rm -rf $dir/.cache' or rebuild the downloader image, then retry."
       exit 1
     fi
   fi
+}
+
+cmd_clean() {
+  local target="${1:-}"
+  case "$target" in
+    model|models)     clean_dir "models" ;;
+    dataset|datasets) clean_dir "datasets" ;;
+    all|"")
+      clean_dir "models"
+      clean_dir "datasets"
+      ;;
+    *)
+      echo "==> Error: Unknown clean target '$target'."
+      echo "    Valid targets: model, dataset, all (omit to clean everything)."
+      exit 1
+      ;;
+  esac
   echo "==> Done."
 }
 
@@ -1053,7 +1093,7 @@ case "${1:-}" in
   convert)  cmd_convert  ;;
   save)     shift; cmd_save "$@" ;;
   rehash)   cmd_rehash "${2:-}" ;;
-  clean)    cmd_clean    ;;
+  clean)    cmd_clean "${2:-}" ;;
   status)   cmd_status   ;;
   *)        show_help    ;;
 esac
