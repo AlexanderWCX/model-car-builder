@@ -9,20 +9,28 @@ defaults to 20G) and also defeats parallel pulls.
 
 This rewrites the weights into evenly sized shards by repacking at the raw-byte
 level -- no torch/numpy, fully dtype-agnostic (bf16/fp8/etc. are copied verbatim)
--- and regenerates model.safetensors.index.json so the build produces many small,
+-- and regenerates the weight index(es) so the build produces many small,
 registry-friendly layers.
 
+Multiple weight sets: a repo may ship more than one independent set of weights,
+each with its OWN index -- e.g. Mistral models carry both the HF format
+(model-0000X-of-Y.safetensors + model.safetensors.index.json) and the Mistral
+"consolidated" format (consolidated-0000X-of-Y.safetensors +
+consolidated.safetensors.index.json), with DIFFERENT tensor naming. Each index
+file plus the shards it references forms a group; groups are resharded
+independently (never merged) and each index is regenerated against its own new
+shards. Loose safetensors not referenced by any index form their own group.
+
 Properties:
-  * Idempotent: if every shard is already <= the target it does nothing.
+  * Idempotent: a group whose shards are already <= the target is left untouched.
   * Crash-safe: new shards are written into a staging subdirectory while the
     originals are left untouched; a COMMITTED marker recording the complete final
-    filename set is fsync'd into place only after all shard data is fsync'd. The
-    commit then MOVES the staged files into place BEFORE deleting any original,
-    and decides what to delete from the immutable marker set -- so it is
-    re-entrant: an interrupted commit is finished, not corrupted, on the next run,
-    and an interrupted write is discarded (originals intact). This matters because
-    `build.sh restore` MOVES weights out of the archive, so models/ can be the
-    only copy.
+    filename set AND the exact originals to remove is fsync'd into place only
+    after all shard data is fsync'd. The commit MOVES staged files into place
+    before deleting any original, and deletes only the recorded superseded files
+    -- so it is re-entrant (an interrupted commit is finished, not corrupted) and
+    never touches a skipped group. This matters because `build.sh restore` MOVES
+    weights out of the archive, so models/ can be the only copy.
 
 Env:
   MODELS_DIR      directory containing top-level *.safetensors (default /models)
@@ -44,7 +52,7 @@ import struct
 import sys
 
 COPY_CHUNK = 16 * 1024 * 1024  # streaming copy buffer -> flat memory use
-INDEX_NAME = "model.safetensors.index.json"
+INDEX_SUFFIX = ".safetensors.index.json"
 STAGING_DIR = ".reshard-staging"
 COMMIT_MARKER = "COMMITTED"
 
@@ -131,105 +139,90 @@ def write_shard(out_path, src_dir, tensors, metadata):
 
 
 def read_marker(staging):
-    """Return the committed final filename set, or None if absent/unreadable."""
+    """Return the marker dict {final_names, remove} or None if absent/unreadable."""
     marker = os.path.join(staging, COMMIT_MARKER)
     if not os.path.exists(marker):
         return None
     try:
         with open(marker) as f:
-            names = json.load(f).get("final_names")
-        return set(names) if names else None
+            m = json.load(f)
+        if isinstance(m, dict) and m.get("final_names") is not None:
+            m.setdefault("remove", [])
+            return m
     except (ValueError, OSError):
-        return None
+        pass
+    return None
 
 
-def commit_staging(staging, models_dir):
-    """Replace the top-level weights with the staged set. Re-entrant: deletion
-    decisions come from the immutable marker set, and staged files are moved into
-    place BEFORE any original is removed, so finishing an interrupted commit never
-    loses data. Only call when the marker is present and valid."""
-    final_names = read_marker(staging)
-    if not final_names:
-        raise ValueError(f"{staging}: missing or invalid commit marker")
+def commit_staging(staging, models_dir, marker):
+    """Atomically replace weights with the staged set. Re-entrant: moves staged
+    files up first, then deletes only the recorded superseded originals (never a
+    file in the new set, never a skipped group's file). Only call with a valid
+    marker."""
+    final_names = set(marker["final_names"])
+    remove = set(marker.get("remove", []))
 
-    # 1) Move staged files up first (same filesystem -> atomic renames). Files
-    #    already moved by a prior interrupted commit are simply absent here.
+    # 1) Move staged files up first (already-moved ones from a prior interrupted
+    #    commit are simply absent here).
     for f in os.listdir(staging):
         if f == COMMIT_MARKER:
             continue
         os.replace(os.path.join(staging, f), os.path.join(models_dir, f))
 
-    # 2) Drop originals that are not part of the new set (decided from the
-    #    immutable marker, not the now-empty staging dir).
-    for e in os.listdir(models_dir):
-        if e == STAGING_DIR or e in final_names:
+    # 2) Delete superseded originals (immutable list from the marker); never a
+    #    file that is part of the new set.
+    for f in remove:
+        if f in final_names:
             continue
-        full = os.path.join(models_dir, e)
-        if e.endswith(".safetensors") and os.path.isfile(full):
-            os.remove(full)
-    # 3) If the new set has no index (single shard), drop any stale one.
-    if INDEX_NAME not in final_names:
-        stale_idx = os.path.join(models_dir, INDEX_NAME)
-        if os.path.exists(stale_idx):
-            os.remove(stale_idx)
+        p = os.path.join(models_dir, f)
+        if os.path.isfile(p):
+            os.remove(p)
 
     fsync_dir(models_dir)
 
-    # 4) Remove the marker and staging dir last.
+    # 3) Remove the marker and staging dir last.
     os.remove(os.path.join(staging, COMMIT_MARKER))
     os.rmdir(staging)
 
 
-def main():
-    models_dir = os.environ.get("MODELS_DIR", "/models")
-    raw_target = os.environ.get("MAX_SHARD_SIZE", "4G")
-    target = parse_size(raw_target)
-    if not os.path.isdir(models_dir):
-        print(f"reshard: {models_dir} is not a directory, nothing to do.")
-        return 0
-
-    # Resolve any prior interrupted run FIRST, before the size check -- recovery
-    # must happen even when resharding is disabled, or a half-committed model
-    # could be left unresolved.
-    staging = os.path.join(models_dir, STAGING_DIR)
-    if os.path.isdir(staging):
-        if read_marker(staging):
-            print("reshard: finishing a commit interrupted by a previous run...")
-            commit_staging(staging, models_dir)
-            print("reshard: recovered; resharded weights are in place.")
-            return 0
-        # No valid marker -> the write was incomplete; originals are intact.
-        print("reshard: discarding incomplete staging from a previous run.")
-        shutil.rmtree(staging)
-
-    if target <= 0:
-        print("reshard: MAX_SHARD_SIZE disabled, skipping reshard.")
-        return 0
-
-    # Top-level safetensors only -- matches the build's per-shard layering, which
-    # uses `find -maxdepth 1`. (Subdirectory weights are copied as whole layers.)
-    entries = sorted(
-        e for e in os.listdir(models_dir)
-        if e.endswith(".safetensors")
-        and os.path.isfile(os.path.join(models_dir, e))
+def discover_groups(models_dir, safetensors):
+    """Group safetensors by the index that references them. Each group:
+    {prefix, index_name (or None), files: [shard names]}. Loose safetensors (not
+    referenced by any index) form a final group."""
+    groups = []
+    claimed = set()
+    index_files = sorted(
+        f for f in os.listdir(models_dir)
+        if f.endswith(INDEX_SUFFIX) and os.path.isfile(os.path.join(models_dir, f))
     )
-    if not entries:
-        print("reshard: no top-level *.safetensors found, nothing to do.")
-        return 0
+    have = set(safetensors)
+    for idxf in index_files:
+        try:
+            with open(os.path.join(models_dir, idxf)) as f:
+                wm = json.load(f).get("weight_map", {})
+        except (ValueError, OSError):
+            continue
+        files = sorted(set(wm.values()) & have)
+        if not files:
+            continue
+        prefix = idxf[:-len(INDEX_SUFFIX)]
+        groups.append({"prefix": prefix, "index_name": idxf, "files": files})
+        claimed.update(files)
 
-    sizes = {e: os.path.getsize(os.path.join(models_dir, e)) for e in entries}
-    biggest = max(sizes.values())
-    if biggest <= target:
-        print(f"reshard: all {len(entries)} shard(s) already <= {human(target)} "
-              f"(largest {human(biggest)}); nothing to do.")
-        return 0
+    loose = sorted(f for f in safetensors if f not in claimed)
+    if loose:
+        taken = {g["prefix"] for g in groups}
+        prefix = "model" if "model" not in taken else "weights"
+        groups.append({"prefix": prefix, "index_name": None, "files": loose})
+    return groups
 
-    # Build a global, ordered tensor list (by filename, then on-disk offset, so
-    # the output preserves natural model order and reads sequentially).
+
+def build_group_tensors(models_dir, files):
+    """Return (tensors, merged_metadata, file_counts) for a group's shard files."""
     merged_metadata = {}
     tensors = []
     file_counts = {}
-    for fname in entries:
+    for fname in files:
         header, data_start = read_header(os.path.join(models_dir, fname))
         meta = header.get("__metadata__")
         if isinstance(meta, dict):
@@ -251,46 +244,13 @@ def main():
         items.sort(key=lambda t: t["src_begin"])
         file_counts[fname] = len(items)
         tensors.extend(items)
+    return tensors, merged_metadata, file_counts
 
-    if not tensors:
-        print("reshard: headers contain no tensors, nothing to do.")
-        return 0
 
-    # A file only benefits from resharding if it is oversized AND holds more than
-    # one tensor (a single tensor cannot be split below its own size). If no file
-    # is both, we are already as small as possible -> no-op. Keeps the step
-    # idempotent even when an individual tensor legitimately exceeds the target.
-    if not any(sizes[f] > target and file_counts[f] > 1 for f in entries):
-        stuck = [f for f in entries if sizes[f] > target]
-        if stuck:
-            print(f"reshard: WARNING {len(stuck)} shard(s) exceed {human(target)} "
-                  f"but each holds a single tensor that cannot be split further "
-                  f"(largest {human(biggest)}); a registry may still reject them.",
-                  file=sys.stderr)
-        print(f"reshard: no shard can be split below {human(target)}; nothing to do.")
-        return 0
-
-    total_size = sum(t["nbytes"] for t in tensors)
-
-    # Disk preflight: the staged copy coexists with the untouched originals until
-    # the commit, so we need roughly `total_size` of additional free space.
-    needed = total_size + (1 << 30)  # + 1 GiB margin
-    st = os.statvfs(models_dir)
-    free = st.f_bavail * st.f_frsize
-    if free < needed:
-        print(f"reshard: ERROR insufficient free space in {models_dir}: need "
-              f"~{human(needed)} free (staged copy coexists with the originals), "
-              f"have {human(free)}.", file=sys.stderr)
-        return 1
-
-    print(f"reshard: target <= {human(target)}/shard; largest current shard is "
-          f"{human(biggest)}. Repacking {len(entries)} file(s) "
-          f"({human(total_size)})...")
-
-    # Greedily pack tensors into shards no larger than the target. A single tensor
-    # bigger than the target cannot be split, so it gets its own (oversized) shard.
-    shards = []
-    cur, cur_size = [], 0
+def pack(tensors, target, prefix):
+    """Greedily pack tensors into shards <= target. A tensor bigger than target
+    gets its own (oversized) shard with a warning."""
+    shards, cur, cur_size = [], [], 0
     for t in tensors:
         nb = t["nbytes"]
         if nb > target:
@@ -298,8 +258,8 @@ def main():
                 shards.append(cur)
                 cur, cur_size = [], 0
             shards.append([t])
-            print(f"reshard: WARNING tensor '{t['name']}' is {human(nb)} > "
-                  f"{human(target)}; it gets its own oversized shard.",
+            print(f"reshard: WARNING [{prefix}] tensor '{t['name']}' is {human(nb)} "
+                  f"> {human(target)}; it gets its own oversized shard.",
                   file=sys.stderr)
             continue
         if cur and cur_size + nb > target:
@@ -309,56 +269,146 @@ def main():
         cur_size += nb
     if cur:
         shards.append(cur)
+    return shards
 
-    n = len(shards)
-    if n == 1:
-        names = ["model.safetensors"]
-    else:
-        names = [f"model-{i + 1:05d}-of-{n:05d}.safetensors" for i in range(n)]
 
-    # Write the new shards into staging; originals stay untouched.
+def main():
+    models_dir = os.environ.get("MODELS_DIR", "/models")
+    target = parse_size(os.environ.get("MAX_SHARD_SIZE", "4G"))
+    if not os.path.isdir(models_dir):
+        print(f"reshard: {models_dir} is not a directory, nothing to do.")
+        return 0
+
+    # Resolve any prior interrupted run FIRST -- recovery must happen even when
+    # resharding is disabled, or a half-committed model could be left unresolved.
+    staging = os.path.join(models_dir, STAGING_DIR)
+    if os.path.isdir(staging):
+        marker = read_marker(staging)
+        if marker:
+            print("reshard: finishing a commit interrupted by a previous run...")
+            commit_staging(staging, models_dir, marker)
+            print("reshard: recovered; resharded weights are in place.")
+            return 0
+        print("reshard: discarding incomplete staging from a previous run.")
+        shutil.rmtree(staging)
+
+    if target <= 0:
+        print("reshard: MAX_SHARD_SIZE disabled, skipping reshard.")
+        return 0
+
+    safetensors = sorted(
+        f for f in os.listdir(models_dir)
+        if f.endswith(".safetensors") and os.path.isfile(os.path.join(models_dir, f))
+    )
+    if not safetensors:
+        print("reshard: no top-level *.safetensors found, nothing to do.")
+        return 0
+
+    groups = discover_groups(models_dir, safetensors)
+
+    # Plan each group independently. A group is resharded only if it has a file
+    # over the target that holds more than one tensor (a single tensor can't be
+    # split below its own size). Skipped groups are left exactly as-is.
+    plans = []
+    for g in groups:
+        sizes = {f: os.path.getsize(os.path.join(models_dir, f)) for f in g["files"]}
+        biggest = max(sizes.values())
+        if biggest <= target:
+            continue
+        tensors, metadata, file_counts = build_group_tensors(models_dir, g["files"])
+        if not tensors:
+            continue
+        if not any(sizes[f] > target and file_counts[f] > 1 for f in g["files"]):
+            print(f"reshard: WARNING [{g['prefix']}] {sum(1 for f in g['files'] if sizes[f] > target)} "
+                  f"shard(s) exceed {human(target)} but each holds a single "
+                  f"unsplittable tensor; a registry may still reject them.",
+                  file=sys.stderr)
+            continue
+        plans.append({"group": g, "tensors": tensors, "metadata": metadata})
+
+    if not plans:
+        print(f"reshard: nothing to do; every weight set is within {human(target)} "
+              f"(or cannot be split further).")
+        return 0
+
+    total_size = sum(t["nbytes"] for p in plans for t in p["tensors"])
+    needed = total_size + (1 << 30)  # staged copy coexists with originals + 1 GiB
+    st = os.statvfs(models_dir)
+    free = st.f_bavail * st.f_frsize
+    if free < needed:
+        print(f"reshard: ERROR insufficient free space in {models_dir}: need "
+              f"~{human(needed)} free (staged copy coexists with the originals), "
+              f"have {human(free)}.", file=sys.stderr)
+        return 1
+
+    set_word = "set" if len(plans) == 1 else "sets"
+    print(f"reshard: target <= {human(target)}/shard; repacking {len(plans)} weight "
+          f"{set_word} ({human(total_size)} total)...")
+
     os.mkdir(staging)
-    for shard_tensors, final_name in zip(shards, names):
-        write_shard(os.path.join(staging, final_name), models_dir,
-                    shard_tensors, merged_metadata)
-        shard_bytes = sum(t["nbytes"] for t in shard_tensors)
-        print(f"  staged {final_name}  ({len(shard_tensors)} tensors, "
-              f"{human(shard_bytes)})")
+    final_names = []
+    remove = set()
+    summaries = []
+    for p in plans:
+        g = p["group"]
+        prefix = g["prefix"]
+        shards = pack(p["tensors"], target, prefix)
+        n = len(shards)
+        if n == 1:
+            names = [f"{prefix}.safetensors"]
+        else:
+            names = [f"{prefix}-{i + 1:05d}-of-{n:05d}.safetensors" for i in range(n)]
 
-    final_names = list(names)
-    if n > 1:
-        weight_map = {}
         for shard_tensors, final_name in zip(shards, names):
-            for t in shard_tensors:
-                weight_map[t["name"]] = final_name
-        index = {
-            "metadata": {"total_size": total_size},
-            "weight_map": dict(sorted(weight_map.items())),
-        }
-        with open(os.path.join(staging, INDEX_NAME), "w") as f:
-            json.dump(index, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        final_names.append(INDEX_NAME)
+            write_shard(os.path.join(staging, final_name), models_dir,
+                        shard_tensors, p["metadata"])
+        final_names.extend(names)
 
-    # All shard data is fsync'd; make their directory entries durable, then write
-    # and fsync the marker (recording the complete final set) so that "marker
-    # present and valid" durably implies "staged set is complete".
+        group_bytes = sum(t["nbytes"] for t in p["tensors"])
+        index_name = prefix + INDEX_SUFFIX
+        if n > 1:
+            weight_map = {}
+            for shard_tensors, final_name in zip(shards, names):
+                for t in shard_tensors:
+                    weight_map[t["name"]] = final_name
+            index = {
+                "metadata": {"total_size": group_bytes},
+                "weight_map": dict(sorted(weight_map.items())),
+            }
+            with open(os.path.join(staging, index_name), "w") as f:
+                json.dump(index, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            final_names.append(index_name)
+
+        # Originals this group supersedes: its old shard files, plus its old index
+        # (regenerated when n>1 -> overwritten by the move; dropped when n==1).
+        remove.update(g["files"])
+        if g["index_name"]:
+            remove.add(g["index_name"])
+        summaries.append((prefix, n, group_bytes))
+
+    remove = sorted(remove - set(final_names))
+
+    # All shard data is fsync'd; make staging's dir entries durable, then write
+    # and fsync the marker so "marker present and valid" durably implies the
+    # staged set is complete.
     fsync_dir(staging)
     with open(os.path.join(staging, COMMIT_MARKER), "w") as f:
-        json.dump({"final_names": final_names}, f)
+        json.dump({"final_names": final_names, "remove": remove}, f)
         f.flush()
         os.fsync(f.fileno())
     fsync_dir(staging)
 
-    commit_staging(staging, models_dir)
+    commit_staging(staging, models_dir, {"final_names": final_names, "remove": remove})
 
-    if n == 1:
-        print(f"reshard: done -> 1 shard 'model.safetensors' "
-              f"({human(total_size)}); removed weight index.")
-    else:
-        print(f"reshard: done -> {n} shards <= {human(target)} each "
-              f"({human(total_size)} total); wrote {INDEX_NAME}.")
+    for prefix, n, group_bytes in summaries:
+        if n == 1:
+            print(f"reshard: [{prefix}] -> 1 shard '{prefix}.safetensors' "
+                  f"({human(group_bytes)}); no index needed.")
+        else:
+            print(f"reshard: [{prefix}] -> {n} shards <= {human(target)} each "
+                  f"({human(group_bytes)}); wrote {prefix}{INDEX_SUFFIX}.")
     return 0
 
 

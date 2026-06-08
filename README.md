@@ -114,6 +114,16 @@ Details:
 
 - **Lossless & dtype-agnostic.** Weights are repacked at the raw-byte level (no
   torch/numpy), so bf16/fp8/any dtype is copied verbatim.
+- **Multiple weight sets.** Some repos ship the model more than once with
+  separate indices — e.g. Mistral models carry both the HF format
+  (`model-*.safetensors` + `model.safetensors.index.json`) and the consolidated
+  format (`consolidated-*.safetensors` + `consolidated.safetensors.index.json`),
+  with *different* tensor naming. Each index plus the shards it references is
+  treated as an independent group: groups are resharded separately (never merged)
+  and **each** index is regenerated against its own new shards. All formats are
+  kept, so the resulting image works with either loader. (This roughly doubles
+  the on-disk size, so a dual-format repo needs ~its full size in free scratch
+  space during resharding — checked up front.)
 - **Idempotent.** If every shard is already ≤ `MAX_SHARD_SIZE`, it does nothing.
   A single tensor larger than the target can't be split — it gets its own shard
   and a warning is printed.

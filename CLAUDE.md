@@ -56,6 +56,7 @@ Top of `build.sh` — set ONE of these, not both:
 - Date tags: YYYYMMDD format
 - Each safetensor shard (or dataset parquet/jsonl shard) gets its own OCI layer for parallel pulls
 - Oversized upstream shards are re-split to ≤ `MAX_SHARD_SIZE` before build so no layer exceeds the registry's per-layer cap (e.g. Quay `MAXIMUM_LAYER_SIZE`, default 20G); the index (`model.safetensors.index.json`) is regenerated to match
+- A repo may ship multiple independent weight sets, each with its own index (e.g. Mistral's HF `model-*` + `model.safetensors.index.json` AND consolidated `consolidated-*` + `consolidated.safetensors.index.json`, with different tensor naming). The resharder groups safetensors by their index and reshards each group separately, regenerating every index — it never merges the sets
 - Final images run as user 65534 (nobody), no ENTRYPOINT
 - Strict bash: `set -euo pipefail`
 - Paths inside container: `/models/` or `/datasets/`
