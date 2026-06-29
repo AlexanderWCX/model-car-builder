@@ -7,7 +7,7 @@ trap 'echo ""; echo "==> Interrupted."; exit 130' INT
 MODEL_REPO=""
 DATASET_REPO=""
 HF_TOKEN=""
-SPLIT_SIZE="4G"
+SPLIT_SIZE="${SPLIT_SIZE:-4G}"
 # Max size per safetensors shard (each shard becomes one OCI layer). Keeps layers
 # under the registry's per-layer cap (e.g. Quay MAXIMUM_LAYER_SIZE, default 20G)
 # and keeps parallel pulls effective. Set empty or "0" to disable. Units: G/M.
